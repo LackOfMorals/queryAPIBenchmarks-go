@@ -4,17 +4,17 @@
 // Naming convention follows the Python classes exactly so results tables
 // from both tools can be compared directly:
 //
-//   Implicit transactions  (single HTTP call, SDK manages the transaction)
-//     - SyncImplicit            sequential, fresh connection per request
-//     - SyncSessionsImplicit    sequential, persistent connection
-//     - GoroutinesImplicit      concurrent, fresh connection per request
-//     - GoroutinesSessionsImplicit  concurrent, persistent connection
+//	Implicit transactions  (single HTTP call, SDK manages the transaction)
+//	  - SyncImplicit            sequential, fresh connection per request
+//	  - SyncSessionsImplicit    sequential, persistent connection
+//	  - GoroutinesImplicit      concurrent, fresh connection per request
+//	  - GoroutinesSessionsImplicit  concurrent, persistent connection
 //
-//   Managed transactions  (begin → execute → commit, 3 HTTP calls per cycle)
-//     - Sync                    sequential, fresh connection per request
-//     - SyncSessions            sequential, persistent connection
-//     - Goroutines              concurrent, fresh connection per request
-//     - GoroutinesSessions      concurrent, persistent connection
+//	Managed transactions  (begin → execute → commit, 3 HTTP calls per cycle)
+//	  - Sync                    sequential, fresh connection per request
+//	  - SyncSessions            sequential, persistent connection
+//	  - Goroutines              concurrent, fresh connection per request
+//	  - GoroutinesSessions      concurrent, persistent connection
 //
 // The Go SDK (query-go-sdk) covers implicit transactions natively via
 // client.Query.Execute / query.WithTransformer.  Managed transactions require
@@ -28,6 +28,8 @@ import (
 
 	query "github.com/neo4j-contrib/query-go-sdk"
 
+	"log/slog"
+
 	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/runner"
 	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/transport"
 )
@@ -39,6 +41,7 @@ type Config struct {
 	Password string
 	Database string
 	Timeout  time.Duration
+	Logger   *slog.Logger
 
 	// HTTP2 enables HTTP/2 for session-based transports.
 	HTTP2 bool
@@ -50,7 +53,7 @@ type Config struct {
 // Helpers
 // --------------------------------------------------------------------------
 
-func implicitFn(client *query.Client, cypher string) runner.TxFunc {
+func implicitFn(client *query.QueryAPIClient, cypher string) runner.TxFunc {
 	return func(ctx context.Context) error {
 		_, err := query.WithTransformer(
 			client.Query,
@@ -61,9 +64,10 @@ func implicitFn(client *query.Client, cypher string) runner.TxFunc {
 		)
 		return err
 	}
+
 }
 
-func newFreshClient(cfg Config) (*query.Client, error) {
+func newFreshClient(cfg Config) (*query.QueryAPIClient, error) {
 	httpClient := transport.NewFresh(cfg.Timeout)
 	return query.NewClient(
 		query.WithBasicAuth(cfg.Username, cfg.Password),
@@ -71,10 +75,11 @@ func newFreshClient(cfg Config) (*query.Client, error) {
 		query.WithDatabase(cfg.Database),
 		query.WithTimeout(cfg.Timeout),
 		query.WithHTTPClient(httpClient),
+		query.WithLogger(cfg.Logger),
 	)
 }
 
-func newSessionClient(cfg Config) (*query.Client, error) {
+func newSessionClient(cfg Config) (*query.QueryAPIClient, error) {
 	if cfg.HTTP2 {
 		httpClient, err := transport.NewSessionHTTP2(cfg.Timeout)
 		if err != nil {
