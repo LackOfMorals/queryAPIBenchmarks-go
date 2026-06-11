@@ -149,7 +149,7 @@ func main() {
 		case "json":
 			results.PrintJSON(entries, label)
 		case "benchstat":
-			results.PrintBenchstat(entries, *apiFlag)
+			results.PrintBenchstat(entries)
 		default:
 			results.PrintTable(entries, label)
 		}

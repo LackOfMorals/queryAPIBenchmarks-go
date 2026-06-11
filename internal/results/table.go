@@ -206,15 +206,15 @@ func PrintJSON(entries []Entry, apiLabel string) {
 //	BenchmarkName/api-N   iterations   ns/op   [p50-ns/op   p99-ns/op]
 //
 // apiSlug is the raw -api flag value ("queryv2" or "legacy"). N is GOMAXPROCS.
-func PrintBenchstat(entries []Entry, apiSlug string) {
+func PrintBenchstat(entries []Entry) {
 	procs := runtime.GOMAXPROCS(0)
 	for _, e := range entries {
 		if e.Result.RequestCount == 0 {
 			continue
 		}
 		nsPerOp := int64(e.Result.TotalSeconds * 1e9 / float64(e.Result.RequestCount))
-		line := fmt.Sprintf("Benchmark%s/%s-%d\t%d\t%d ns/op",
-			e.Name, apiSlug, procs,
+		line := fmt.Sprintf("Benchmark%s-%d\t%d\t%d ns/op",
+			e.Name, procs,
 			e.Result.RequestCount,
 			nsPerOp,
 		)
