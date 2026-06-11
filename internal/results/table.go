@@ -72,7 +72,7 @@ func truncate(s string, n int) string {
 // The test-name column expands or contracts to fill the available terminal
 // width. Each entry occupies two lines: summary stats on the first, latency
 // percentiles on the second (when duration data is available).
-func PrintTable(entries []Entry) {
+func PrintTable(entries []Entry, apiLabel string) {
 	colTest := testColWidth()
 
 	header := fmt.Sprintf("%-*s  %-*s  %-*s  %-*s",
@@ -94,6 +94,7 @@ func PrintTable(entries []Entry) {
 	divider := strings.Repeat("-", width)
 
 	fmt.Println()
+	fmt.Printf("API: %s\n", apiLabel)
 	fmt.Println(divider)
 	fmt.Println(header)
 	fmt.Println(latHeader)
