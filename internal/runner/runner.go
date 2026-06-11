@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,7 +57,7 @@ func warmup(ctx context.Context, cfg Config, fn TxFunc) error {
 		return nil
 	}
 
-	fmt.Printf("Warmup: %s [0/%d]\r", cfg.Name, cfg.WarmupRequests)
+	fmt.Fprintf(os.Stderr, "Warmup: %s [0/%d]\r", cfg.Name, cfg.WarmupRequests)
 
 	for i := range cfg.WarmupRequests {
 		reqCtx, cancel := requestContext(ctx, cfg.Timeout)
@@ -64,13 +65,13 @@ func warmup(ctx context.Context, cfg Config, fn TxFunc) error {
 		cancel()
 
 		if err != nil {
-			fmt.Printf("Warning: warmup request %d failed: %v\n", i+1, err)
+			fmt.Fprintf(os.Stderr, "Warning: warmup request %d failed: %v\n", i+1, err)
 		}
 
-		fmt.Printf("Warmup: %s [%d/%d]\r", cfg.Name, i+1, cfg.WarmupRequests)
+		fmt.Fprintf(os.Stderr, "Warmup: %s [%d/%d]\r", cfg.Name, i+1, cfg.WarmupRequests)
 	}
 
-	fmt.Printf("Warmup: %s done             \n", cfg.Name)
+	fmt.Fprintf(os.Stderr, "Warmup: %s done             \n", cfg.Name)
 	return nil
 }
 
@@ -79,30 +80,34 @@ func measure(ctx context.Context, cfg Config, fn TxFunc, concurrent bool) (Resul
 	var failures atomic.Int64
 
 	if !concurrent {
-		fmt.Printf("%s [0/%d]\r", cfg.Name, cfg.Requests)
+		fmt.Fprintf(os.Stderr, "%s [0/%d]\r", cfg.Name, cfg.Requests)
 
+		durations := make([]time.Duration, 0, cfg.Requests)
 		start := time.Now()
 
 		for i := range cfg.Requests {
 			reqCtx, cancel := requestContext(ctx, cfg.Timeout)
+			reqStart := time.Now()
 			err := fn(reqCtx)
+			durations = append(durations, time.Since(reqStart))
 			cancel()
 
 			if err != nil {
 				failures.Add(1)
-				fmt.Printf("Warning: request %d failed: %v\n", i+1, err)
+				fmt.Fprintf(os.Stderr, "Warning: request %d failed: %v\n", i+1, err)
 			}
 
-			fmt.Printf("%s [%d/%d]\r", cfg.Name, i+1, cfg.Requests)
+			fmt.Fprintf(os.Stderr, "%s [%d/%d]\r", cfg.Name, i+1, cfg.Requests)
 		}
 
 		elapsed := time.Since(start)
-		fmt.Printf("%s done             \n", cfg.Name)
+		fmt.Fprintf(os.Stderr, "%s done             \n", cfg.Name)
 
 		return Result{
 			TotalSeconds: elapsed.Seconds(),
 			RequestCount: cfg.Requests,
 			FailureCount: int(failures.Load()),
+			Durations:    durations,
 		}, nil
 	}
 
@@ -121,7 +126,10 @@ func measure(ctx context.Context, cfg Config, fn TxFunc, concurrent bool) (Resul
 	var wg sync.WaitGroup
 	var completed atomic.Int64
 
-	fmt.Printf("%s [0/%d]\r", cfg.Name, cfg.Requests)
+	// Pre-allocate; each goroutine writes to its own index via the atomic counter.
+	durations := make([]time.Duration, cfg.Requests)
+
+	fmt.Fprintf(os.Stderr, "%s [0/%d]\r", cfg.Name, cfg.Requests)
 
 	start := time.Now()
 
@@ -131,13 +139,16 @@ func measure(ctx context.Context, cfg Config, fn TxFunc, concurrent bool) (Resul
 			defer wg.Done()
 			for range jobs {
 				reqCtx, cancel := requestContext(ctx, cfg.Timeout)
+				reqStart := time.Now()
 				err := fn(reqCtx)
+				elapsed := time.Since(reqStart)
 				cancel()
 				if err != nil {
 					failures.Add(1)
 				}
 				done := completed.Add(1)
-				fmt.Printf("%s [%d/%d]\r", cfg.Name, done, cfg.Requests)
+				durations[done-1] = elapsed
+				fmt.Fprintf(os.Stderr, "%s [%d/%d]\r", cfg.Name, done, cfg.Requests)
 			}
 		}()
 	}
@@ -145,12 +156,13 @@ func measure(ctx context.Context, cfg Config, fn TxFunc, concurrent bool) (Resul
 	wg.Wait()
 	elapsed := time.Since(start)
 
-	fmt.Printf("%s done             \n", cfg.Name)
+	fmt.Fprintf(os.Stderr, "%s done             \n", cfg.Name)
 
 	return Result{
 		TotalSeconds: elapsed.Seconds(),
 		RequestCount: cfg.Requests,
 		FailureCount: int(failures.Load()),
+		Durations:    durations,
 	}, nil
 }
 

@@ -24,12 +24,14 @@ package benchmarks
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	query "github.com/neo4j-contrib/query-go-sdk"
 
 	"log/slog"
 
+	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/managed"
 	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/runner"
 	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/transport"
 )
@@ -165,39 +167,64 @@ func GoroutinesSessionsImplicit(ctx context.Context, cfg Config, cypher string) 
 // --------------------------------------------------------------------------
 // These call the raw Query API transaction endpoints (begin → execute → commit)
 // because the query-go-sdk does not yet expose a managed-transaction API.
-// The managed HTTP client is in internal/managed (to be implemented).
+
+func managedFn(client *managed.Client, cypher string) runner.TxFunc {
+	return func(ctx context.Context) error {
+		return client.RunTransaction(ctx, cypher)
+	}
+}
 
 // Sync mirrors Python BenchmarkSync.
 // Sequential managed transactions, fresh connection per request.
 func Sync(ctx context.Context, cfg Config, cypher string) (runner.Result, error) {
-	// TODO: implement using internal/managed.NewFreshTx when the managed
-	// transaction layer is added.  Placeholder returns a zero result for now
-	// so the binary compiles and the implicit tests can be validated first.
-	_ = cypher
+	client := managed.NewClient(
+		transport.NewFresh(cfg.Timeout),
+		cfg.URL, cfg.Database, cfg.Username, cfg.Password,
+	)
 	cfg.Config.Name = "Sync"
-	return runner.Result{}, nil
+	return runner.Run(ctx, cfg.Config, managedFn(client, cypher))
 }
 
 // SyncSessions mirrors Python BenchmarkSyncSessions.
-// Sequential managed transactions, persistent connection.
+// Sequential managed transactions, persistent connection (+ optional HTTP/2).
 func SyncSessions(ctx context.Context, cfg Config, cypher string) (runner.Result, error) {
-	_ = cypher
+	httpClient, err := sessionHTTPClient(cfg)
+	if err != nil {
+		return runner.Result{}, err
+	}
+	client := managed.NewClient(httpClient, cfg.URL, cfg.Database, cfg.Username, cfg.Password)
 	cfg.Config.Name = "SyncSessions"
-	return runner.Result{}, nil
+	return runner.Run(ctx, cfg.Config, managedFn(client, cypher))
 }
 
 // Goroutines mirrors Python BenchmarkThreads.
 // Concurrent managed transactions, fresh connection per request.
 func Goroutines(ctx context.Context, cfg Config, cypher string) (runner.Result, error) {
-	_ = cypher
+	client := managed.NewClient(
+		transport.NewFresh(cfg.Timeout),
+		cfg.URL, cfg.Database, cfg.Username, cfg.Password,
+	)
 	cfg.Config.Name = "Goroutines"
-	return runner.Result{}, nil
+	return runner.RunConcurrent(ctx, cfg.Config, managedFn(client, cypher))
 }
 
 // GoroutinesSessions mirrors Python BenchmarkThreadsSessions.
-// Concurrent managed transactions, persistent connection.
+// Concurrent managed transactions, persistent connection (+ optional HTTP/2).
 func GoroutinesSessions(ctx context.Context, cfg Config, cypher string) (runner.Result, error) {
-	_ = cypher
+	httpClient, err := sessionHTTPClient(cfg)
+	if err != nil {
+		return runner.Result{}, err
+	}
+	client := managed.NewClient(httpClient, cfg.URL, cfg.Database, cfg.Username, cfg.Password)
 	cfg.Config.Name = "GoroutinesSessions"
-	return runner.Result{}, nil
+	return runner.RunConcurrent(ctx, cfg.Config, managedFn(client, cypher))
+}
+
+// sessionHTTPClient returns the appropriate *http.Client for session-based
+// managed benchmarks, respecting the HTTP2 flag.
+func sessionHTTPClient(cfg Config) (*http.Client, error) {
+	if cfg.HTTP2 {
+		return transport.NewSessionHTTP2(cfg.Timeout)
+	}
+	return transport.NewSession(cfg.Timeout), nil
 }
