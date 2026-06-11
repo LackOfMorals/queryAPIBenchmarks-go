@@ -5,8 +5,12 @@ package results
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/runner"
 )
@@ -17,17 +21,59 @@ type Entry struct {
 	Result runner.Result
 }
 
+// fixed column widths (chars) that don't resize with the terminal.
+const (
+	colTime = 12
+	colRPS  = 10
+	colFail = 14
+	colSeps = 6 // 3 × "  " between the four summary columns
+	colLat  = 10 // width of each latency stat column
+	colTestMin = 20
+)
+
+// terminalWidth returns the current terminal width, checking $COLUMNS first,
+// then the stdout fd, and falling back to 80 when neither is available
+// (e.g. when stdout is redirected).
+func terminalWidth() int {
+	if s := os.Getenv("COLUMNS"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return n
+		}
+	}
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		return w
+	}
+	return 80
+}
+
+// testColWidth derives the test-name column width from the terminal width,
+// leaving fixed columns and separators their standard sizes.
+func testColWidth() int {
+	w := terminalWidth() - colTime - colRPS - colFail - colSeps
+	if w < colTestMin {
+		return colTestMin
+	}
+	return w
+}
+
+// truncate shortens s to fit within n chars, appending "..." when trimmed.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if n <= 3 {
+		return s[:n]
+	}
+	return s[:n-3] + "..."
+}
+
 // PrintTable writes an ASCII table of benchmark results to stdout, marking
 // unreliable runs (>10% failure rate) with an asterisk.
-// Each entry occupies two lines: summary stats on the first, latency
+// The test-name column expands or contracts to fill the available terminal
+// width. Each entry occupies two lines: summary stats on the first, latency
 // percentiles on the second (when duration data is available).
 func PrintTable(entries []Entry) {
-	const (
-		colTest = 32
-		colTime = 12
-		colRPS  = 10
-		colFail = 14
-	)
+	colTest := testColWidth()
 
 	header := fmt.Sprintf("%-*s  %-*s  %-*s  %-*s",
 		colTest, "Test",
@@ -35,11 +81,17 @@ func PrintTable(entries []Entry) {
 		colRPS, "Req/s",
 		colFail, "Failures",
 	)
-	latHeader := fmt.Sprintf("  %-10s %-10s %-10s %-10s %-10s %-10s",
-		"min", "p50", "p95", "p99", "max", "stddev",
+	latHeader := fmt.Sprintf("  %-*s %-*s %-*s %-*s %-*s %-*s",
+		colLat, "min",
+		colLat, "p50",
+		colLat, "p95",
+		colLat, "p99",
+		colLat, "max",
+		colLat, "stddev",
 	)
 
-	divider := strings.Repeat("-", max(len(header), len(latHeader)))
+	width := max(len(header), len(latHeader))
+	divider := strings.Repeat("-", width)
 
 	fmt.Println()
 	fmt.Println(divider)
@@ -55,6 +107,7 @@ func PrintTable(entries []Entry) {
 			name += " *"
 			hasUnreliable = true
 		}
+		name = truncate(name, colTest)
 
 		fmt.Printf("%-*s  %-*s  %-*s  %-*s\n",
 			colTest, name,
@@ -64,13 +117,13 @@ func PrintTable(entries []Entry) {
 		)
 
 		if len(e.Result.Durations) > 0 {
-			fmt.Printf("  %-10s %-10s %-10s %-10s %-10s %-10s\n",
-				fmtDur(e.Result.Min()),
-				fmtDur(e.Result.Percentile(0.50)),
-				fmtDur(e.Result.Percentile(0.95)),
-				fmtDur(e.Result.Percentile(0.99)),
-				fmtDur(e.Result.Max()),
-				fmtDur(e.Result.StdDev()),
+			fmt.Printf("  %-*s %-*s %-*s %-*s %-*s %-*s\n",
+				colLat, fmtDur(e.Result.Min()),
+				colLat, fmtDur(e.Result.Percentile(0.50)),
+				colLat, fmtDur(e.Result.Percentile(0.95)),
+				colLat, fmtDur(e.Result.Percentile(0.99)),
+				colLat, fmtDur(e.Result.Max()),
+				colLat, fmtDur(e.Result.StdDev()),
 			)
 		}
 	}
@@ -86,13 +139,13 @@ func PrintTable(entries []Entry) {
 
 // jsonEntry is the shape written by PrintJSON.
 type jsonEntry struct {
-	Name               string      `json:"name"`
-	TotalSeconds       float64     `json:"total_seconds"`
-	RequestCount       int         `json:"request_count"`
-	FailureCount       int         `json:"failure_count"`
-	RequestsPerSecond  float64     `json:"requests_per_second"`
-	Unreliable         bool        `json:"unreliable"`
-	LatencyMS          *latencyMS  `json:"latency_ms,omitempty"`
+	Name              string     `json:"name"`
+	TotalSeconds      float64    `json:"total_seconds"`
+	RequestCount      int        `json:"request_count"`
+	FailureCount      int        `json:"failure_count"`
+	RequestsPerSecond float64    `json:"requests_per_second"`
+	Unreliable        bool       `json:"unreliable"`
+	LatencyMS         *latencyMS `json:"latency_ms,omitempty"`
 }
 
 type latencyMS struct {
@@ -151,4 +204,3 @@ func fmtDur(d time.Duration) string {
 func msf(d time.Duration) float64 {
 	return float64(d) / float64(time.Millisecond)
 }
-
