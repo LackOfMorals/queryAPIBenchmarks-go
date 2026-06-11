@@ -158,8 +158,9 @@ type latencyMS struct {
 	StdDev float64 `json:"stddev"`
 }
 
-// PrintJSON writes benchmark results as a JSON array to stdout.
-func PrintJSON(entries []Entry) {
+// PrintJSON writes benchmark results as a JSON object to stdout.
+// apiLabel is included as the "api_flavor" key so runs are self-describing.
+func PrintJSON(entries []Entry, apiLabel string) {
 	out := make([]jsonEntry, 0, len(entries))
 	for _, e := range entries {
 		je := jsonEntry{
@@ -184,7 +185,12 @@ func PrintJSON(entries []Entry) {
 		out = append(out, je)
 	}
 
-	b, err := json.MarshalIndent(out, "", "  ")
+	envelope := struct {
+		APIFlavor string      `json:"api_flavor"`
+		Results   []jsonEntry `json:"results"`
+	}{APIFlavor: apiLabel, Results: out}
+
+	b, err := json.MarshalIndent(envelope, "", "  ")
 	if err != nil {
 		fmt.Printf(`{"error": %q}`, err.Error())
 		return

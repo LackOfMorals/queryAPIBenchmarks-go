@@ -1,7 +1,9 @@
-// Package managed executes explicit Neo4j Query API v2 transactions via raw
-// HTTP calls: POST /tx (begin) → POST /tx/{id} (execute) → POST /tx/{id}/commit.
-// The query-go-sdk does not yet expose a managed-transaction API, so this
-// package talks directly to the HTTP endpoints.
+// Package managed executes explicit Neo4j transactions via raw HTTP calls:
+// POST /tx (begin) → POST /tx/{id} (execute) → POST /tx/{id}/commit.
+//
+// Two API flavors are supported:
+//   - Query API v2: /db/{db}/query/v2/tx  (single-statement body)
+//   - Legacy HTTP:  /db/{db}/tx           (statements-array body)
 package managed
 
 import (
@@ -18,23 +20,39 @@ import (
 // Client executes managed transactions against a single Neo4j database.
 type Client struct {
 	httpClient *http.Client
-	txURL      string // "{baseURL}/db/{database}/query/v2/tx"
+	txURL      string // base transaction URL, flavor-specific
 	authHeader string // "Basic <base64(user:pass)>"
+	legacy     bool   // true → Legacy Cypher HTTP Transaction API
 }
 
-// NewClient constructs a Client.  httpClient controls connection behaviour
-// (fresh vs. session, HTTP/2) and must not be nil.
-func NewClient(httpClient *http.Client, baseURL, database, username, password string) *Client {
+// NewClient constructs a Client. Set legacy=true to target /db/{db}/tx
+// (Legacy Cypher HTTP Transaction API) instead of /db/{db}/query/v2/tx.
+// httpClient controls connection behaviour (fresh vs. session, HTTP/2).
+func NewClient(httpClient *http.Client, baseURL, database, username, password string, legacy bool) *Client {
 	auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	base := strings.TrimRight(baseURL, "/")
+	var txURL string
+	if legacy {
+		txURL = base + "/db/" + database + "/tx"
+	} else {
+		txURL = base + "/db/" + database + "/query/v2/tx"
+	}
 	return &Client{
 		httpClient: httpClient,
-		txURL:      strings.TrimRight(baseURL, "/") + "/db/" + database + "/query/v2/tx",
+		txURL:      txURL,
 		authHeader: "Basic " + auth,
+		legacy:     legacy,
 	}
 }
 
+// v2 execute body: {"statement": "..."}
 type statementBody struct {
 	Statement string `json:"statement"`
+}
+
+// legacy execute body: {"statements": [{"statement": "..."}]}
+type legacyStatements struct {
+	Statements []statementBody `json:"statements"`
 }
 
 // RunTransaction executes begin → execute(cypher) → commit in sequence.
@@ -78,7 +96,14 @@ func (c *Client) begin(ctx context.Context) (string, error) {
 }
 
 func (c *Client) execute(ctx context.Context, txID, cypher string) error {
-	body, _ := json.Marshal(statementBody{Statement: cypher})
+	var payload any
+	if c.legacy {
+		payload = legacyStatements{Statements: []statementBody{{Statement: cypher}}}
+	} else {
+		payload = statementBody{Statement: cypher}
+	}
+	body, _ := json.Marshal(payload)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.txURL+"/"+txID, bytes.NewReader(body))
 	if err != nil {
 		return err

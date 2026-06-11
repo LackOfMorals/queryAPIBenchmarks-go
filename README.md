@@ -40,6 +40,7 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 | `NETWORK_TIMEOUT`    | `-timeout`  | `30`                 | Per-request timeout (seconds)                    |
 | `NETWORK_HTTP2`      | `-http2`    | `0`                  | Use HTTP/2 for session transports (requires https) |
 | `OUTPUT_FORMAT`      | `-format`   | `table`              | Output format: `table` or `json`                 |
+| `NEO4J_API`          | `-api`      | `queryv2`            | API to target: `queryv2` or `legacy`             |
 
 ## Usage
 
@@ -64,6 +65,13 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 # JSON output (stdout is clean; progress goes to stderr)
 ./bench -t SyncImplicit -t GoroutinesSessionsImplicit -n 100 -format json
 ./bench -t SyncImplicit -n 100 -format json 2>/dev/null | python3 -m json.tool
+
+# Target the legacy Cypher HTTP Transaction API (/db/{db}/tx/commit)
+./bench -t SyncImplicit -api legacy -n 100
+
+# Side-by-side API comparison
+./bench -t SyncImplicit -t SyncSessionsImplicit -n 100 -api queryv2 -format json > v2.json
+./bench -t SyncImplicit -t SyncSessionsImplicit -n 100 -api legacy  -format json > legacy.json
 ```
 
 ## Output
@@ -105,6 +113,28 @@ SyncImplicit                      1.234      81        0 / 50
 ```
 
 Progress output always goes to stderr, so stdout can be cleanly piped when using `-format json`.
+
+The JSON envelope includes an `api_flavor` key so output files are self-describing:
+
+```json
+{
+  "api_flavor": "Neo4j Query API v2 (/db/{db}/query/v2)",
+  "results": [ ... ]
+}
+```
+
+## API flavors
+
+Use `-api` to select which Neo4j HTTP API the benchmarks target:
+
+| Value | Endpoint | Notes |
+|---|---|---|
+| `queryv2` _(default)_ | `/db/{db}/query/v2` | Modern Query API; typed JSON responses |
+| `legacy` | `/db/{db}/tx/commit` (implicit) / `/db/{db}/tx` (managed) | Legacy Cypher HTTP Transaction API |
+
+All eight benchmarks work with both flavors. The selected API is printed to stderr before any test runs.
+
+> **Note:** `legacy` requires Neo4j 4.x or later with the HTTP transaction API enabled. Aura instances use `queryv2`.
 
 ## Available tests
 

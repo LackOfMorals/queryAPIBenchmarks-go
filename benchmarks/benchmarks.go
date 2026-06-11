@@ -48,6 +48,9 @@ type Config struct {
 	// HTTP2 enables HTTP/2 for session-based transports.
 	HTTP2 bool
 
+	// Flavor selects which Neo4j HTTP API to target.
+	Flavor query.APIFlavor
+
 	runner.Config
 }
 
@@ -78,6 +81,7 @@ func newFreshClient(cfg Config) (*query.QueryAPIClient, error) {
 		query.WithTimeout(cfg.Timeout),
 		query.WithHTTPClient(httpClient),
 		query.WithLogger(cfg.Logger),
+		query.WithAPIFlavor(cfg.Flavor),
 	)
 }
 
@@ -93,6 +97,7 @@ func newSessionClient(cfg Config) (*query.QueryAPIClient, error) {
 			query.WithDatabase(cfg.Database),
 			query.WithTimeout(cfg.Timeout),
 			query.WithHTTPClient(httpClient),
+			query.WithAPIFlavor(cfg.Flavor),
 		)
 	}
 
@@ -103,6 +108,7 @@ func newSessionClient(cfg Config) (*query.QueryAPIClient, error) {
 		query.WithDatabase(cfg.Database),
 		query.WithTimeout(cfg.Timeout),
 		query.WithHTTPClient(httpClient),
+		query.WithAPIFlavor(cfg.Flavor),
 	)
 }
 
@@ -180,6 +186,7 @@ func Sync(ctx context.Context, cfg Config, cypher string) (runner.Result, error)
 	client := managed.NewClient(
 		transport.NewFresh(cfg.Timeout),
 		cfg.URL, cfg.Database, cfg.Username, cfg.Password,
+		cfg.Flavor == query.FlavorLegacyHTTP,
 	)
 	cfg.Config.Name = "Sync"
 	return runner.Run(ctx, cfg.Config, managedFn(client, cypher))
@@ -192,7 +199,8 @@ func SyncSessions(ctx context.Context, cfg Config, cypher string) (runner.Result
 	if err != nil {
 		return runner.Result{}, err
 	}
-	client := managed.NewClient(httpClient, cfg.URL, cfg.Database, cfg.Username, cfg.Password)
+	client := managed.NewClient(httpClient, cfg.URL, cfg.Database, cfg.Username, cfg.Password,
+		cfg.Flavor == query.FlavorLegacyHTTP)
 	cfg.Config.Name = "SyncSessions"
 	return runner.Run(ctx, cfg.Config, managedFn(client, cypher))
 }
@@ -203,6 +211,7 @@ func Goroutines(ctx context.Context, cfg Config, cypher string) (runner.Result, 
 	client := managed.NewClient(
 		transport.NewFresh(cfg.Timeout),
 		cfg.URL, cfg.Database, cfg.Username, cfg.Password,
+		cfg.Flavor == query.FlavorLegacyHTTP,
 	)
 	cfg.Config.Name = "Goroutines"
 	return runner.RunConcurrent(ctx, cfg.Config, managedFn(client, cypher))
@@ -215,7 +224,8 @@ func GoroutinesSessions(ctx context.Context, cfg Config, cypher string) (runner.
 	if err != nil {
 		return runner.Result{}, err
 	}
-	client := managed.NewClient(httpClient, cfg.URL, cfg.Database, cfg.Username, cfg.Password)
+	client := managed.NewClient(httpClient, cfg.URL, cfg.Database, cfg.Username, cfg.Password,
+		cfg.Flavor == query.FlavorLegacyHTTP)
 	cfg.Config.Name = "GoroutinesSessions"
 	return runner.RunConcurrent(ctx, cfg.Config, managedFn(client, cypher))
 }

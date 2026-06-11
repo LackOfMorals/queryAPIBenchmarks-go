@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/joho/godotenv v1.5.1
-	github.com/neo4j-contrib/query-go-sdk v0.1.2
+	github.com/neo4j-contrib/query-go-sdk v0.2.0
 	golang.org/x/net v0.55.0
 )
 
