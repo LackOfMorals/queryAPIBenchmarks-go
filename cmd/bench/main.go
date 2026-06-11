@@ -65,8 +65,9 @@ func main() {
 	maxWorkers     := flag.Int("workers", intEnv("MAX_WORKERS", 4), "Goroutine count for concurrent tests")
 	timeoutSecs    := flag.Int("timeout", intEnv("NETWORK_TIMEOUT", 30), "Per-request timeout in seconds")
 	http2Flag      := flag.Bool("http2", boolEnv("NETWORK_HTTP2"), "Use HTTP/2 for session transports")
-	format         := flag.String("format", env("OUTPUT_FORMAT", "table"), "Output format: table or json")
+	format         := flag.String("format", env("OUTPUT_FORMAT", "table"), "Output format: table, json, or benchstat")
 	apiFlag        := flag.String("api", env("NEO4J_API", "queryv2"), "API to benchmark: queryv2 (Neo4j Query API v2) or legacy (Cypher HTTP Transaction API)")
+	debugFlag      := flag.Bool("debug", boolEnv("DEBUG"), "Enable debug log output")
 
 	neo4jURL    := flag.String("url", env("NEO4J_URL", "http://localhost:7474"), "Neo4j base URL")
 	neo4jUsr    := flag.String("usr", env("NEO4J_USERNAME", "neo4j"), "Neo4j username")
@@ -98,7 +99,11 @@ func main() {
 		flavor = query.FlavorLegacyHTTP
 	}
 
-	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	level := slog.LevelInfo
+	if *debugFlag {
+		level = slog.LevelDebug
+	}
+	opts := &slog.HandlerOptions{Level: level}
 	handler := slog.NewTextHandler(os.Stderr, opts)
 	customLogger := slog.New(handler)
 
@@ -143,6 +148,8 @@ func main() {
 		switch *format {
 		case "json":
 			results.PrintJSON(entries, label)
+		case "benchstat":
+			results.PrintBenchstat(entries, *apiFlag)
 		default:
 			results.PrintTable(entries, label)
 		}

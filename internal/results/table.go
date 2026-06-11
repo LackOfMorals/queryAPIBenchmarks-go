@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -197,6 +198,34 @@ func PrintJSON(entries []Entry, apiLabel string) {
 		return
 	}
 	fmt.Println(string(b))
+}
+
+// PrintBenchstat emits one line per entry in the standard Go benchmark format
+// consumed by golang.org/x/perf/cmd/benchstat:
+//
+//	BenchmarkName/api-N   iterations   ns/op   [p50-ns/op   p99-ns/op]
+//
+// apiSlug is the raw -api flag value ("queryv2" or "legacy"). N is GOMAXPROCS.
+func PrintBenchstat(entries []Entry, apiSlug string) {
+	procs := runtime.GOMAXPROCS(0)
+	for _, e := range entries {
+		if e.Result.RequestCount == 0 {
+			continue
+		}
+		nsPerOp := int64(e.Result.TotalSeconds * 1e9 / float64(e.Result.RequestCount))
+		line := fmt.Sprintf("Benchmark%s/%s-%d\t%d\t%d ns/op",
+			e.Name, apiSlug, procs,
+			e.Result.RequestCount,
+			nsPerOp,
+		)
+		if len(e.Result.Durations) > 0 {
+			line += fmt.Sprintf("\t%d p50-ns/op\t%d p99-ns/op",
+				e.Result.Percentile(0.50).Nanoseconds(),
+				e.Result.Percentile(0.99).Nanoseconds(),
+			)
+		}
+		fmt.Println(line)
+	}
 }
 
 // fmtDur formats a duration as a human-readable string (ms or µs).
