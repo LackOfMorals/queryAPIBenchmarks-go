@@ -6,3 +6,6 @@
 v2.txt
 results.txt
 legacy.txt
+
+/results
+.DS_Store

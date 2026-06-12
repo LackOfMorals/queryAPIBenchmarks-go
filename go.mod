@@ -3,6 +3,7 @@ module github.com/LackOfMorals/queryAPIBenchmarks-go
 go 1.25.0
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/neo4j-contrib/query-go-sdk v0.2.0
 	golang.org/x/net v0.55.0

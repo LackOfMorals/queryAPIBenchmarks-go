@@ -23,6 +23,7 @@ import (
 	query "github.com/neo4j-contrib/query-go-sdk"
 
 	"github.com/LackOfMorals/queryAPIBenchmarks-go/benchmarks"
+	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/queryfile"
 	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/results"
 	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/runner"
 	"github.com/joho/godotenv"
@@ -66,14 +67,16 @@ func main() {
 	timeoutSecs    := flag.Int("timeout", intEnv("NETWORK_TIMEOUT", 30), "Per-request timeout in seconds")
 	http2Flag      := flag.Bool("http2", boolEnv("NETWORK_HTTP2"), "Use HTTP/2 for session transports")
 	format         := flag.String("format", env("OUTPUT_FORMAT", "table"), "Output format: table, json, or benchstat")
+	runsFlag       := flag.Int("runs", intEnv("BENCH_RUNS", 1), "Number of independent runs (use with -format benchstat for confidence intervals)")
 	apiFlag        := flag.String("api", env("NEO4J_API", "queryv2"), "API to benchmark: queryv2 (Neo4j Query API v2) or legacy (Cypher HTTP Transaction API)")
 	debugFlag      := flag.Bool("debug", boolEnv("DEBUG"), "Enable debug log output")
 
-	neo4jURL    := flag.String("url", env("NEO4J_URL", "http://localhost:7474"), "Neo4j base URL")
-	neo4jUsr    := flag.String("usr", env("NEO4J_USERNAME", "neo4j"), "Neo4j username")
-	neo4jPwd    := flag.String("pwd", env("NEO4J_PASSWORD", "password"), "Neo4j password")
-	neo4jDB     := flag.String("db", env("NEO4J_DATABASE", "neo4j"), "Neo4j database name")
-	neo4jCypher := flag.String("cypher", env("NEO4J_CYPHER", "RETURN 1"), "Cypher statement to benchmark")
+	neo4jURL        := flag.String("url", env("NEO4J_URL", "http://localhost:7474"), "Neo4j base URL")
+	neo4jUsr        := flag.String("usr", env("NEO4J_USERNAME", "neo4j"), "Neo4j username")
+	neo4jPwd        := flag.String("pwd", env("NEO4J_PASSWORD", "password"), "Neo4j password")
+	neo4jDB         := flag.String("db", env("NEO4J_DATABASE", "neo4j"), "Neo4j database name")
+	neo4jCypher     := flag.String("cypher", env("NEO4J_CYPHER", "RETURN 1"), "Cypher statement to benchmark")
+	queriesFile     := flag.String("queries-file", "", "TOML file of named queries (mutually exclusive with -cypher)")
 
 	flag.Parse()
 
@@ -92,6 +95,27 @@ func main() {
 	if *apiFlag != "queryv2" && *apiFlag != "legacy" {
 		fmt.Fprintf(os.Stderr, "Error: -api must be \"queryv2\" or \"legacy\"\n")
 		os.Exit(1)
+	}
+
+	if *runsFlag < 1 {
+		fmt.Fprintf(os.Stderr, "Error: -runs must be >= 1\n")
+		os.Exit(1)
+	}
+	if *runsFlag > 1 && *format != "benchstat" {
+		fmt.Fprintf(os.Stderr, "Warning: -runs %d has no effect with -format %s; use -format benchstat\n", *runsFlag, *format)
+	}
+
+	if *queriesFile != "" {
+		var cypherExplicit bool
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "cypher" {
+				cypherExplicit = true
+			}
+		})
+		if cypherExplicit {
+			fmt.Fprintf(os.Stderr, "Error: -queries-file and -cypher are mutually exclusive\n")
+			os.Exit(1)
+		}
 	}
 
 	flavor := query.FlavorQueryV2
@@ -129,27 +153,53 @@ func main() {
 	label := apiLabel(flavor)
 	fmt.Fprintf(os.Stderr, "API: %s\n", label)
 
+	// Resolve the query list — either from a file or the single -cypher flag.
+	queries, err := resolveQueries(*queriesFile, *neo4jCypher)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	ctx := context.Background()
 	var entries []results.Entry
 
-	for _, name := range tests {
-		fmt.Fprintf(os.Stderr, "\nRunning %s...\n", name)
-
-		result, err := dispatch(ctx, name, benchCfg, *neo4jCypher)
-		if err != nil {
-			log.Printf("ERROR %s: %v\n", name, err)
-			continue
+	for run := range *runsFlag {
+		if *runsFlag > 1 {
+			fmt.Fprintf(os.Stderr, "\n=== Run %d/%d ===\n", run+1, *runsFlag)
 		}
 
-		entries = append(entries, results.Entry{Name: name, Result: result})
+		var runEntries []results.Entry
+		for _, q := range queries {
+			for _, name := range tests {
+				if q.Label != "" {
+					fmt.Fprintf(os.Stderr, "\nRunning %s [%s]...\n", name, q.Label)
+				} else {
+					fmt.Fprintf(os.Stderr, "\nRunning %s...\n", name)
+				}
+
+				result, err := dispatch(ctx, name, benchCfg, q.Cypher)
+				if err != nil {
+					log.Printf("ERROR %s: %v\n", name, err)
+					continue
+				}
+
+				runEntries = append(runEntries, results.Entry{Name: name, QueryLabel: q.Label, Result: result})
+			}
+		}
+
+		if *format == "benchstat" {
+			// Flush each run immediately so output streams and benchstat can
+			// accumulate repeated benchmark names as independent samples.
+			results.PrintBenchstat(runEntries)
+		} else {
+			entries = append(entries, runEntries...)
+		}
 	}
 
-	if len(entries) > 0 {
+	if *format != "benchstat" && len(entries) > 0 {
 		switch *format {
 		case "json":
 			results.PrintJSON(entries, label)
-		case "benchstat":
-			results.PrintBenchstat(entries)
 		default:
 			results.PrintTable(entries, label)
 		}
@@ -213,4 +263,14 @@ func intEnv(key string, fallback int) int {
 func boolEnv(key string) bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
 	return v == "1" || v == "true" || v == "yes"
+}
+
+// resolveQueries returns the query list to benchmark.
+// If queriesFilePath is set it loads queries from that TOML file;
+// otherwise it wraps the single cypher string as an unlabelled query.
+func resolveQueries(queriesFilePath, cypher string) ([]queryfile.Query, error) {
+	if queriesFilePath != "" {
+		return queryfile.Load(queriesFilePath)
+	}
+	return []queryfile.Query{{Label: "", Cypher: cypher}}, nil
 }

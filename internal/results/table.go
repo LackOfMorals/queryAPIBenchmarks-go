@@ -18,8 +18,9 @@ import (
 
 // Entry pairs a test name with its result.
 type Entry struct {
-	Name   string
-	Result runner.Result
+	Name       string
+	QueryLabel string // non-empty when running a named query file (sub-benchmark)
+	Result     runner.Result
 }
 
 // fixed column widths (chars) that don't resize with the terminal.
@@ -105,6 +106,9 @@ func PrintTable(entries []Entry, apiLabel string) {
 
 	for _, e := range entries {
 		name := e.Name
+		if e.QueryLabel != "" {
+			name = e.QueryLabel + "/" + name
+		}
 		if e.Result.IsUnreliable() {
 			name += " *"
 			hasUnreliable = true
@@ -165,8 +169,12 @@ type latencyMS struct {
 func PrintJSON(entries []Entry, apiLabel string) {
 	out := make([]jsonEntry, 0, len(entries))
 	for _, e := range entries {
+		name := e.Name
+		if e.QueryLabel != "" {
+			name = e.QueryLabel + "/" + name
+		}
 		je := jsonEntry{
-			Name:              e.Name,
+			Name:              name,
 			TotalSeconds:      e.Result.TotalSeconds,
 			RequestCount:      e.Result.RequestCount,
 			FailureCount:      e.Result.FailureCount,
@@ -213,8 +221,12 @@ func PrintBenchstat(entries []Entry) {
 			continue
 		}
 		nsPerOp := int64(e.Result.TotalSeconds * 1e9 / float64(e.Result.RequestCount))
+		benchName := e.Name
+		if e.QueryLabel != "" {
+			benchName = e.Name + "/" + e.QueryLabel
+		}
 		line := fmt.Sprintf("Benchmark%s-%d\t%d\t%d ns/op",
-			e.Name, procs,
+			benchName, procs,
 			e.Result.RequestCount,
 			nsPerOp,
 		)
