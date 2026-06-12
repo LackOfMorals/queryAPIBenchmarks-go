@@ -16,13 +16,8 @@ cypher = "MATCH (:Company {companyNumber: 'SC521741'})<-[:OFFICER_OF]-(p:Person)
 
 [[queries]]
 label  = "two-hop"
-#cypher = "MATCH (:Company {companyNumber: 'SC521741'})<-[:OFFICER_OF]-(p:Person)-[:OFFICER_OF]->(other:Company) RETURN DISTINCT other.name, other.companyNumber, p.chName LIMIT 50"
 cypher = "MATCH (:Company {companyNumber: 'SC521741'})<-[:OFFICER_OF]-(p:Person) WITH p MATCH (p)-[:OFFICER_OF]->(other:Company) RETURN DISTINCT other.name, other.companyNumber, p.chName LIMIT 50"
 
-#[[queries]]
-#label  = "aggregation"
-#cypher = "MATCH (c:Company)-[:HAS_SIC_CODE]->(s:SICCode) RETURN s.code, count(c) AS companyCount ORDER BY companyCount DESC LIMIT 20"
-#cypher = "MATCH (s:SICCode)<-[:HAS_SIC_CODE]-(c:Company) WITH s, count(c) AS n ORDER BY n DESC LIMIT 20 RETURN s.code, n"
 
 [[queries]]
 label  = "bulk-rows"
