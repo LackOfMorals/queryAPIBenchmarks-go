@@ -262,24 +262,82 @@ func TestApiLabel(t *testing.T) {
 	}
 }
 
-func TestHasBoltScheme(t *testing.T) {
-	tests := []struct {
-		url  string
-		want bool
+func TestValidSchemes(t *testing.T) {
+	httpTests := []struct {
+		scheme string
+		want   bool
 	}{
-		{url: "bolt://localhost:7687", want: true},
-		{url: "bolt+s://localhost:7687", want: true},
-		{url: "neo4j://localhost:7687", want: true},
-		{url: "neo4j+ssc://localhost:7687", want: true},
-		{url: "http://localhost:7474", want: false},
-		{url: "https://localhost:7474", want: false},
-		{url: "not-a-url", want: false},
-		{url: "", want: false},
+		{scheme: "http", want: true},
+		{scheme: "https", want: true},
+		{scheme: "bolt", want: false},
+		{scheme: "", want: false},
+	}
+	for _, tt := range httpTests {
+		t.Run("http/"+tt.scheme, func(t *testing.T) {
+			if got := validHTTPSchemes[tt.scheme]; got != tt.want {
+				t.Errorf("validHTTPSchemes[%q] = %v, want %v", tt.scheme, got, tt.want)
+			}
+		})
+	}
+
+	boltTests := []struct {
+		scheme string
+		want   bool
+	}{
+		{scheme: "bolt", want: true},
+		{scheme: "bolt+s", want: true},
+		{scheme: "bolt+ssc", want: true},
+		{scheme: "neo4j", want: true},
+		{scheme: "neo4j+s", want: true},
+		{scheme: "neo4j+ssc", want: true},
+		{scheme: "http", want: false},
+		{scheme: "https", want: false},
+		{scheme: "", want: false},
+	}
+	for _, tt := range boltTests {
+		t.Run("bolt/"+tt.scheme, func(t *testing.T) {
+			if got := validBoltSchemes[tt.scheme]; got != tt.want {
+				t.Errorf("validBoltSchemes[%q] = %v, want %v", tt.scheme, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		kind       benchmarks.Kind
+		host       string
+		httpScheme string
+		httpPort   int
+		boltScheme string
+		boltPort   int
+		want       string
+	}{
+		{
+			name: "query v2 uses the http scheme and port",
+			kind: benchmarks.KindQueryV2, host: "ip-10-0-29-201.ec2.internal",
+			httpScheme: "http", httpPort: 7474, boltScheme: "neo4j", boltPort: 7687,
+			want: "http://ip-10-0-29-201.ec2.internal:7474",
+		},
+		{
+			name: "legacy also uses the http scheme and port",
+			kind: benchmarks.KindLegacy, host: "localhost",
+			httpScheme: "https", httpPort: 7473, boltScheme: "neo4j", boltPort: 7687,
+			want: "https://localhost:7473",
+		},
+		{
+			name: "bolt uses the bolt scheme and port, ignoring the http ones",
+			kind: benchmarks.KindBolt, host: "ip-10-0-29-201.ec2.internal",
+			httpScheme: "http", httpPort: 7474, boltScheme: "bolt+s", boltPort: 7687,
+			want: "bolt+s://ip-10-0-29-201.ec2.internal:7687",
+		},
 	}
 	for _, tt := range tests {
-		t.Run(tt.url, func(t *testing.T) {
-			if got := hasBoltScheme(tt.url); got != tt.want {
-				t.Errorf("hasBoltScheme(%q) = %v, want %v", tt.url, got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildURL(tt.kind, tt.host, tt.httpScheme, tt.httpPort, tt.boltScheme, tt.boltPort)
+			if got != tt.want {
+				t.Errorf("buildURL() = %q, want %q", got, tt.want)
 			}
 		})
 	}

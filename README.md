@@ -31,7 +31,11 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 
 | Environment variable | Flag        | Default              | Description                                      |
 |----------------------|-------------|----------------------|--------------------------------------------------|
-| `NEO4J_URL`          | `-url`      | `http://localhost:7474` | Base URL (`bolt://`/`neo4j://` when `-api bolt`) |
+| `NEO4J_HOST`         | `-host`     | `localhost`          | Host only — an IP or FQDN, no scheme or port     |
+| `NEO4J_HTTP_SCHEME`  | `-http-scheme` | `http`            | Scheme for `queryv2`/`legacy`: `http` or `https` |
+| `NEO4J_HTTP_PORT`    | `-http-port`   | `7474`            | Port for `queryv2`/`legacy`                      |
+| `NEO4J_BOLT_SCHEME`  | `-bolt-scheme` | `neo4j`           | Scheme for `-api bolt`: `bolt`, `bolt+s`, `bolt+ssc`, `neo4j`, `neo4j+s`, or `neo4j+ssc` |
+| `NEO4J_BOLT_PORT`    | `-bolt-port`   | `7687`            | Port for `-api bolt`                             |
 | `NEO4J_USERNAME`     | `-usr`      | `neo4j`              | Username                                         |
 | `NEO4J_PASSWORD`     | `-pwd`      | _(empty)_            | Password                                         |
 | `NEO4J_DATABASE`     | `-db`       | `neo4j`              | Database name                                    |
@@ -40,7 +44,7 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 | `WARMUP_REQUESTS`    | `-warmup`   | `5`                  | Warmup iterations before timing (0 to skip)      |
 | `MAX_WORKERS`        | `-workers`  | `4`                  | Goroutines for concurrent tests                  |
 | `NETWORK_TIMEOUT`    | `-timeout`  | `30`                 | Per-request timeout (seconds)                    |
-| `NETWORK_HTTP2`      | `-http2`    | `0`                  | Use HTTP/2 for session transports (requires https; ignored with `-api bolt`) |
+| `NETWORK_HTTP2`      | `-http2`    | `0`                  | Use HTTP/2 for `-connection pooled` (requires `-http-scheme https`; ignored with `-api bolt`) |
 | `OUTPUT_FORMAT`      | `-format`   | `table`              | Output format: `table` or `json`                 |
 | `NEO4J_API`          | `-api`      | `queryv2`            | Backend to target: `queryv2`, `legacy`, or `bolt` |
 | —                    | `-transaction` | _(required, unless `-api bolt`)_ | Transaction style (repeatable): `implicit`, `managed`, or `all` |
@@ -74,13 +78,22 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 ./bench -transaction implicit -api legacy -n 100
 
 # Target the official Bolt driver (v6) — no -transaction/-connection needed,
-# Bolt only runs the auto-commit implicit style over one pooled Driver
-./bench -api bolt -url neo4j://localhost:7687 -concurrency all -n 100
+# Bolt only runs the auto-commit implicit style over one pooled Driver.
+# -bolt-scheme/-bolt-port default to neo4j/7687, so -host is often all you need.
+./bench -api bolt -host db01.example.internal -concurrency all -n 100
+
+# Same, but explicit about scheme and port (e.g. a single instance behind TLS)
+./bench -api bolt -host db01.example.internal -bolt-scheme bolt+s -bolt-port 7687 -n 100
+
+# -host has no scheme or port, so the same value works unchanged across
+# backends — only -http-scheme/-http-port or -bolt-scheme/-bolt-port differ
+./bench -api queryv2 -host db01.example.internal -http-scheme https -http-port 7473 -n 100
+./bench -api bolt    -host db01.example.internal -n 100
 
 # Side-by-side backend comparison
 ./bench -transaction implicit -connection all -n 100 -api queryv2 -format json > v2.json
 ./bench -transaction implicit -connection all -n 100 -api legacy  -format json > legacy.json
-./bench -concurrency all -n 100 -api bolt -url neo4j://localhost:7687 -format json > bolt.json
+./bench -concurrency all -n 100 -api bolt -host db01.example.internal -format json > bolt.json
 ```
 
 ## Output
@@ -141,15 +154,15 @@ The JSON envelope includes an `api_flavor` key so output files are self-describi
 
 Use `-api` to select which Neo4j access backend the benchmarks target:
 
-| Value | Transport | Notes |
+| Value | Transport | Scheme + port come from |
 |---|---|---|
-| `queryv2` _(default)_ | HTTP `/db/{db}/query/v2` | Modern Query API; typed JSON responses |
-| `legacy` | HTTP `/db/{db}/tx/commit` (implicit) / `/db/{db}/tx` (managed) | Legacy Cypher HTTP Transaction API |
-| `bolt` | Bolt, via the official [neo4j-go-driver/v6](https://github.com/neo4j/neo4j-go-driver) | Native driver; connects with `bolt://` or `neo4j://` |
+| `queryv2` _(default)_ | HTTP `/db/{db}/query/v2` | `-http-scheme`/`-http-port` |
+| `legacy` | HTTP `/db/{db}/tx/commit` (implicit) / `/db/{db}/tx` (managed) | `-http-scheme`/`-http-port` |
+| `bolt` | Bolt, via the official [neo4j-go-driver/v6](https://github.com/neo4j/neo4j-go-driver) | `-bolt-scheme`/`-bolt-port` |
 
-The selected backend is printed to stderr before any test runs.
+`-host` is scheme/port-free (an IP or FQDN only) and used unchanged for every value above; `buildURL` in `cmd/bench/main.go` combines it with whichever scheme/port apply to `-api`. The selected backend is printed to stderr before any test runs.
 
-> **Note:** `legacy` requires Neo4j 4.x or later with the HTTP transaction API enabled. Aura instances use `queryv2`. `bolt` requires `-url` to use a `bolt://`/`neo4j://` scheme, not `http://`.
+> **Note:** `legacy` requires Neo4j 4.x or later with the HTTP transaction API enabled. Aura instances use `queryv2`.
 
 ## Available tests
 
@@ -220,5 +233,5 @@ queryAPIBenchmarks-go/
 | `generate_table` | `results.PrintTable` / `results.PrintJSON` |
 | `is_unreliable` (>10% failures) | `Result.IsUnreliable()` |
 
-HTTP/2 requires `https://` — point `-url` at an Aura endpoint or a
+HTTP/2 requires `-http-scheme https` — point `-host` at an Aura endpoint or a
 locally TLS-terminated Neo4j instance when using `-http2`.

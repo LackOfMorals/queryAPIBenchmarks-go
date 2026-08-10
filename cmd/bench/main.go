@@ -3,7 +3,7 @@
 // Usage:
 //
 //	bench -transaction implicit -concurrency all -n 100 \
-//	      -url http://localhost:7474 -usr neo4j -pwd secret \
+//	      -host localhost -usr neo4j -pwd secret \
 //	      -db neo4j -cypher 'RETURN 1'
 //
 // All flags can also be set via environment variables (matching the Python
@@ -62,7 +62,11 @@ func main() {
 	modeFlag := flag.String("mode", env("NEO4J_ACCESS_MODE", "read"), "Access mode: read or write")
 	debugFlag := flag.Bool("debug", boolEnv("DEBUG"), "Enable debug log output")
 
-	neo4jURL := flag.String("url", env("NEO4J_URL", "http://localhost:7474"), "Neo4j base URL (bolt://... or neo4j://... when -api bolt)")
+	hostFlag := flag.String("host", env("NEO4J_HOST", "localhost"), "Neo4j host: an IP or FQDN, no scheme or port")
+	httpSchemeFlag := flag.String("http-scheme", env("NEO4J_HTTP_SCHEME", "http"), "Scheme for queryv2/legacy: http or https")
+	httpPortFlag := flag.Int("http-port", intEnv("NEO4J_HTTP_PORT", 7474), "Port for queryv2/legacy")
+	boltSchemeFlag := flag.String("bolt-scheme", env("NEO4J_BOLT_SCHEME", "neo4j"), "Scheme for -api bolt: bolt, bolt+s, bolt+ssc, neo4j, neo4j+s, or neo4j+ssc")
+	boltPortFlag := flag.Int("bolt-port", intEnv("NEO4J_BOLT_PORT", 7687), "Port for -api bolt")
 	neo4jUsr := flag.String("usr", env("NEO4J_USERNAME", "neo4j"), "Neo4j username")
 	neo4jPwd := flag.String("pwd", env("NEO4J_PASSWORD", "password"), "Neo4j password")
 	neo4jDB := flag.String("db", env("NEO4J_DATABASE", "neo4j"), "Neo4j database name")
@@ -91,14 +95,19 @@ func main() {
 	}
 
 	if kind == benchmarks.KindBolt {
-		if !hasBoltScheme(*neo4jURL) {
-			fmt.Fprintf(os.Stderr, "Error: -api bolt requires a bolt:// or neo4j:// -url (got %q); e.g. -url neo4j://localhost:7687\n", *neo4jURL)
+		if !validBoltSchemes[*boltSchemeFlag] {
+			fmt.Fprintf(os.Stderr, "Error: -bolt-scheme must be one of: bolt, bolt+s, bolt+ssc, neo4j, neo4j+s, neo4j+ssc (got %q)\n", *boltSchemeFlag)
 			os.Exit(1)
 		}
 		if *http2Flag {
 			fmt.Fprintf(os.Stderr, "Warning: -http2 has no effect with -api bolt; ignoring\n")
 		}
+	} else if !validHTTPSchemes[*httpSchemeFlag] {
+		fmt.Fprintf(os.Stderr, "Error: -http-scheme must be \"http\" or \"https\" (got %q)\n", *httpSchemeFlag)
+		os.Exit(1)
 	}
+
+	targetURL := buildURL(kind, *hostFlag, *httpSchemeFlag, *httpPortFlag, *boltSchemeFlag, *boltPortFlag)
 
 	transactions, err := resolveTransactions(transactionFlag, kind)
 	if err != nil {
@@ -146,7 +155,7 @@ func main() {
 	timeout := time.Duration(*timeoutSecs) * time.Second
 
 	benchCfg := benchmarks.Config{
-		URL:        *neo4jURL,
+		URL:        targetURL,
 		Username:   *neo4jUsr,
 		Password:   *neo4jPwd,
 		Database:   *neo4jDB,
@@ -385,21 +394,22 @@ func apiLabel(kind benchmarks.Kind) string {
 	}
 }
 
-// hasBoltScheme reports whether rawURL uses a Bolt-family scheme
-// (bolt/bolt+s/bolt+ssc/neo4j/neo4j+s/neo4j+ssc). An http(s):// URL against
-// the driver fails with a confusing low-level error, so this is checked
-// up front.
-func hasBoltScheme(rawURL string) bool {
-	i := strings.Index(rawURL, "://")
-	if i < 0 {
-		return false
+var validHTTPSchemes = map[string]bool{"http": true, "https": true}
+
+var validBoltSchemes = map[string]bool{
+	"bolt": true, "bolt+s": true, "bolt+ssc": true,
+	"neo4j": true, "neo4j+s": true, "neo4j+ssc": true,
+}
+
+// buildURL combines the plain host with whichever scheme+port apply to
+// kind, so -host never needs a scheme or port of its own: HTTP (queryv2,
+// legacy) and Bolt use different schemes and, typically, different ports on
+// the same node.
+func buildURL(kind benchmarks.Kind, host, httpScheme string, httpPort int, boltScheme string, boltPort int) string {
+	if kind == benchmarks.KindBolt {
+		return fmt.Sprintf("%s://%s:%d", boltScheme, host, boltPort)
 	}
-	switch rawURL[:i] {
-	case "bolt", "bolt+s", "bolt+ssc", "neo4j", "neo4j+s", "neo4j+ssc":
-		return true
-	default:
-		return false
-	}
+	return fmt.Sprintf("%s://%s:%d", httpScheme, host, httpPort)
 }
 
 func intEnv(key string, fallback int) int {

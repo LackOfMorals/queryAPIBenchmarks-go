@@ -1,30 +1,30 @@
 // Package managed executes explicit Neo4j transactions via raw HTTP calls:
 // POST /tx (begin) → POST /tx/{id} (execute) → POST /tx/{id}/commit.
 //
-// Two API flavors are supported:
-//   - Query API v2: /db/{db}/query/v2/tx  (single-statement body)
-//   - Legacy HTTP:  /db/{db}/tx           (statements-array body)
+// Two API flavors are supported, and they use different cluster-routing
+// mechanisms for keeping all three calls of a cycle on the node that owns
+// the transaction:
 //
-// # Cluster routing
+//   - Legacy HTTP (/db/{db}/tx, statements-array body): the begin response's
+//     Location header carries the transaction's full URL, built from that
+//     node's server.http.advertised_address. This package follows that URL
+//     directly for execute/commit, bypassing any load balancer for those two
+//     calls. For that to work, each node's server.http.advertised_address
+//     must be its own resolvable, directly-reachable address (see
+//     docs/awsSetup/neo4/neo4j.conf), not the load balancer's — if the
+//     Location host is unreachable you will see "dns" or "conn-refused" in
+//     the runner's error breakdown rather than a confusing 404.
 //
-// A transaction exists only on the cluster member that created it. All three
-// calls in a begin/execute/commit cycle must therefore reach the same node.
-//
-// Neo4j supports this by returning the transaction's full URL in the Location
-// header of the begin response, built from that node's
-// server.http.advertised_address. This package follows that URL for the
-// remaining calls, so the cycle stays pinned to the owning node even when
-// begin was sent through a round-robin load balancer.
-//
-// Two things must hold for that to work:
-//
-//   - Each node's server.http.advertised_address must be its own resolvable
-//     address, not the load balancer's.
-//   - The client must be able to reach nodes directly (i.e. run the benchmark
-//     inside the VPC).
-//
-// If the Location host is unreachable you will see "dns" or "conn-refused" in
-// the runner's error breakdown rather than a confusing 404.
+//   - Query API v2 (/db/{db}/query/v2/tx, single-statement body): there is no
+//     dependable Location header — the documented, always-present source for
+//     the transaction id is the "transaction.id" field of the begin
+//     response's JSON body (https://neo4j.com/docs/query-api/current/transactions/).
+//     Routing back to the owning member happens via the "neo4j-cluster-affinity"
+//     response header on begin, which this package captures and replays on
+//     execute/commit/rollback; execute/commit/rollback keep going through
+//     whatever endpoint begin used (typically the load balancer), and the
+//     cluster itself routes using that header rather than the client
+//     targeting a node's address directly.
 package managed
 
 import (
@@ -43,6 +43,20 @@ import (
 
 // bodySnippetLimit caps how much of an error response body is retained.
 const bodySnippetLimit = 256
+
+// clusterAffinityHeader is the Query API v2 header that pins the
+// execute/commit/rollback calls of an explicit transaction to the cluster
+// member that began it. The server sets it on the begin response; the client
+// must replay the same value on every later call in that transaction.
+const clusterAffinityHeader = "neo4j-cluster-affinity"
+
+// transaction identifies an in-flight explicit transaction: the URL to send
+// execute/commit/rollback to, and (Query API v2 only) the cluster-affinity
+// token to replay on each of those calls.
+type transaction struct {
+	url      string
+	affinity string
+}
 
 // Client executes managed transactions against a single Neo4j database.
 type Client struct {
@@ -94,48 +108,55 @@ type legacyEnvelope struct {
 	} `json:"errors"`
 }
 
-
 // RunTransaction executes begin → execute(cypher) → commit in sequence.
 // On execute failure a best-effort rollback (DELETE) is attempted before
 // returning the error.
 func (c *Client) RunTransaction(ctx context.Context, cypher string) error {
-	txURL, err := c.begin(ctx)
+	tx, err := c.begin(ctx)
 	if err != nil {
 		return err
 	}
-	if err := c.execute(ctx, txURL, cypher); err != nil {
-		_ = c.rollback(ctx, txURL)
+	if err := c.execute(ctx, tx, cypher); err != nil {
+		_ = c.rollback(ctx, tx)
 		return err
 	}
-	return c.commit(ctx, txURL)
+	return c.commit(ctx, tx)
 }
 
-// begin opens a transaction and returns its absolute URL.
-//
-// The returned URL — not just the transaction id — is what subsequent calls
-// must use. See the package comment on cluster routing.
-func (c *Client) begin(ctx context.Context) (string, error) {
+// begin opens a transaction. See the package comment for how the returned
+// transaction is built and routed for each flavor.
+func (c *Client) begin(ctx context.Context) (transaction, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.txURL, http.NoBody)
 	if err != nil {
-		return "", err
+		return transaction{}, err
 	}
-	c.setHeaders(req)
+	c.setHeaders(req, "")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return transaction{}, err
 	}
 	defer drain(resp)
 
 	// Accept any 2xx: Query API v2 and the legacy API have both used 200 and
 	// 201 for this across versions.
 	if !isSuccess(resp.StatusCode) {
-		return "", &httperr.StatusError{Op: "begin", Code: resp.StatusCode, Body: snippet(resp.Body)}
+		return transaction{}, &httperr.StatusError{Op: "begin", Code: resp.StatusCode, Body: snippet(resp.Body)}
 	}
 
+	if c.legacy {
+		return c.beginLegacy(resp)
+	}
+	return c.beginQueryV2(resp)
+}
+
+// beginLegacy resolves the transaction URL from the begin response's
+// Location header — the mechanism the Legacy Cypher HTTP Transaction API has
+// always used.
+func (c *Client) beginLegacy(resp *http.Response) (transaction, error) {
 	loc := resp.Header.Get("Location")
 	if loc == "" {
-		return "", fmt.Errorf("begin: no Location header in response")
+		return transaction{}, fmt.Errorf("begin: no Location header in response")
 	}
 
 	// Resolve against the request URL so a relative Location still works.
@@ -143,16 +164,46 @@ func (c *Client) begin(ctx context.Context) (string, error) {
 	// node that owns this transaction.
 	base, err := url.Parse(c.txURL)
 	if err != nil {
-		return "", fmt.Errorf("begin: bad base URL %q: %w", c.txURL, err)
+		return transaction{}, fmt.Errorf("begin: bad base URL %q: %w", c.txURL, err)
 	}
 	ref, err := url.Parse(loc)
 	if err != nil {
-		return "", fmt.Errorf("begin: bad Location %q: %w", loc, err)
+		return transaction{}, fmt.Errorf("begin: bad Location %q: %w", loc, err)
 	}
-	return base.ResolveReference(ref).String(), nil
+	return transaction{url: base.ResolveReference(ref).String()}, nil
 }
 
-func (c *Client) execute(ctx context.Context, txURL, cypher string) error {
+// beginQueryV2Response is the minimal shape needed to read the transaction
+// id out of a Query API v2 begin response.
+type beginQueryV2Response struct {
+	Transaction struct {
+		ID string `json:"id"`
+	} `json:"transaction"`
+}
+
+// beginQueryV2 builds the transaction URL from the begin response body's
+// "transaction.id" field — Query API v2 does not reliably set Location
+// behind a load balancer or cluster, but the body field is documented as
+// always present. It also captures the cluster-affinity header so later
+// calls route to the same member without needing that member's address.
+func (c *Client) beginQueryV2(resp *http.Response) (transaction, error) {
+	affinity := resp.Header.Get(clusterAffinityHeader)
+
+	var env beginQueryV2Response
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return transaction{}, fmt.Errorf("begin: decode response body: %w", err)
+	}
+	if env.Transaction.ID == "" {
+		return transaction{}, fmt.Errorf(`begin: response body has no "transaction.id"`)
+	}
+
+	return transaction{
+		url:      strings.TrimRight(c.txURL, "/") + "/" + env.Transaction.ID,
+		affinity: affinity,
+	}, nil
+}
+
+func (c *Client) execute(ctx context.Context, tx transaction, cypher string) error {
 	var payload any
 	if c.legacy {
 		payload = legacyStatements{Statements: []statementBody{{Statement: cypher}}}
@@ -164,11 +215,11 @@ func (c *Client) execute(ctx context.Context, txURL, cypher string) error {
 		return fmt.Errorf("execute: marshal body: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, txURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tx.url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	c.setHeaders(req)
+	c.setHeaders(req, tx.affinity)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -182,12 +233,12 @@ func (c *Client) execute(ctx context.Context, txURL, cypher string) error {
 	return c.checkBody("execute", resp)
 }
 
-func (c *Client) commit(ctx context.Context, txURL string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(txURL, "/")+"/commit", http.NoBody)
+func (c *Client) commit(ctx context.Context, tx transaction) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(tx.url, "/")+"/commit", http.NoBody)
 	if err != nil {
 		return err
 	}
-	c.setHeaders(req)
+	c.setHeaders(req, tx.affinity)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -201,12 +252,12 @@ func (c *Client) commit(ctx context.Context, txURL string) error {
 	return c.checkBody("commit", resp)
 }
 
-func (c *Client) rollback(ctx context.Context, txURL string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, txURL, http.NoBody)
+func (c *Client) rollback(ctx context.Context, tx transaction) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, tx.url, http.NoBody)
 	if err != nil {
 		return err
 	}
-	c.setHeaders(req)
+	c.setHeaders(req, tx.affinity)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -216,9 +267,15 @@ func (c *Client) rollback(ctx context.Context, txURL string) error {
 	return nil
 }
 
-func (c *Client) setHeaders(req *http.Request) {
+// setHeaders sets the headers common to every call in a transaction cycle.
+// affinity is the cluster-affinity token to replay (Query API v2 only); pass
+// "" for begin, where there is nothing to replay yet.
+func (c *Client) setHeaders(req *http.Request, affinity string) {
 	req.Header.Set("Authorization", c.authHeader)
 	req.Header.Set("Content-Type", "application/json")
+	if affinity != "" {
+		req.Header.Set(clusterAffinityHeader, affinity)
+	}
 	if c.legacy {
 		if c.readAccessMode {
 			req.Header.Set("Access-Mode", "READ")
