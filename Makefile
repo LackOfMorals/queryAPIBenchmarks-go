@@ -4,7 +4,7 @@ build:
 	go build -o bench ./cmd/bench
 
 run:
-	go run ./cmd/bench -t SyncImplicit -t SyncSessionsImplicit \
+	go run ./cmd/bench -transaction implicit -connection all \
 		-url $(NEO4J_URL) -usr $(NEO4J_USERNAME) -pwd $(NEO4J_PASSWORD) \
 		-db $(NEO4J_DATABASE) -n 10
 
@@ -50,8 +50,7 @@ WORKERS ?= 8
 # All four implicit-transaction test types.
 # Covers: fresh-conn-sequential, persistent-conn-sequential,
 #         fresh-conn-concurrent, persistent-conn-concurrent.
-ALL_IMPLICIT := -t SyncImplicit -t SyncSessionsImplicit \
-                -t GoroutinesImplicit -t GoroutinesSessionsImplicit
+ALL_IMPLICIT := -transaction implicit -concurrency all -connection all
 
 # ---------------------------------------------------------------------------
 # 1. POINT LOOKUP
@@ -141,12 +140,12 @@ bench-bulk-rows: build
 # ---------------------------------------------------------------------------
 bench-warmup: build
 	@echo ">>> Warming up plan cache and page cache — results discarded <<<"
-	./bench -t SyncImplicit \
+	./bench -transaction implicit -connection fresh \
 	  -url $(NEO4J_URL) -usr $(NEO4J_USERNAME) -pwd $(NEO4J_PASSWORD) \
 	  -db $(NEO4J_DATABASE) \
 	  -cypher "MATCH (c:Company {companyNumber: '02026964'}) RETURN c.name" \
 	  -n 50 -warmup 0 -workers 4
-	./bench -t SyncImplicit \
+	./bench -transaction implicit -connection fresh \
 	  -url $(NEO4J_URL) -usr $(NEO4J_USERNAME) -pwd $(NEO4J_PASSWORD) \
 	  -db $(NEO4J_DATABASE) \
 	  -cypher "MATCH (c:Company)-[:HAS_SIC_CODE]->(s:SICCode) RETURN s.code, count(c) AS n ORDER BY n DESC LIMIT 20" \

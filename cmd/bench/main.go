@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	bench -t SyncImplicit -t GoroutinesSessionsImplicit -n 100 \
+//	bench -transaction implicit -concurrency all -n 100 \
 //	      -url http://localhost:7474 -usr neo4j -pwd secret \
 //	      -db neo4j -cypher 'RETURN 1'
 //
@@ -29,23 +29,11 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// multiFlag allows -t to be specified more than once.
+// multiFlag allows a flag to be specified more than once.
 type multiFlag []string
 
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
-
-// available lists all benchmark names in the same order as the Python tool.
-var available = []string{
-	"Sync",
-	"SyncSessions",
-	"Goroutines",
-	"GoroutinesSessions",
-	"SyncImplicit",
-	"SyncSessionsImplicit",
-	"GoroutinesImplicit",
-	"GoroutinesSessionsImplicit",
-}
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -57,46 +45,37 @@ func env(key, fallback string) string {
 func main() {
 	_ = godotenv.Load()
 
-	var tests multiFlag
+	var transactionFlag, concurrencyFlag, connectionFlag multiFlag
 
-	flag.Var(&tests, "t", "Benchmark to run (repeatable). Choices: "+strings.Join(available, ", "))
+	flag.Var(&transactionFlag, "transaction", "Transaction style (repeatable): implicit, managed, or all. Required unless -api bolt (fixed at implicit).")
+	flag.Var(&concurrencyFlag, "concurrency", "Concurrency (repeatable): sequential, concurrent, or all. Default: sequential.")
+	flag.Var(&connectionFlag, "connection", "HTTP connection reuse (repeatable): fresh, pooled, or all. Default: fresh. Not applicable to -api bolt (always pooled).")
 
-	numRequests    := flag.Int("n", intEnv("NUM_REQUESTS", 50), "Number of timed requests")
+	numRequests := flag.Int("n", intEnv("NUM_REQUESTS", 50), "Number of timed requests")
 	warmupRequests := flag.Int("warmup", intEnv("WARMUP_REQUESTS", 5), "Warmup iterations before timing (0 to skip)")
-	maxWorkers     := flag.Int("workers", intEnv("MAX_WORKERS", 4), "Goroutine count for concurrent tests")
-	timeoutSecs    := flag.Int("timeout", intEnv("NETWORK_TIMEOUT", 30), "Per-request timeout in seconds")
-	http2Flag      := flag.Bool("http2", boolEnv("NETWORK_HTTP2"), "Use HTTP/2 for session transports")
-	format         := flag.String("format", env("OUTPUT_FORMAT", "table"), "Output format: table, json, or benchstat")
-	runsFlag       := flag.Int("runs", intEnv("BENCH_RUNS", 1), "Number of independent runs (use with -format benchstat for confidence intervals)")
-	apiFlag        := flag.String("api", env("NEO4J_API", "queryv2"), "API to benchmark: queryv2 (Neo4j Query API v2) or legacy (Cypher HTTP Transaction API)")
-	modeFlag       := flag.String("mode", env("NEO4J_ACCESS_MODE", "read"), "Access mode: read or write")
-	debugFlag      := flag.Bool("debug", boolEnv("DEBUG"), "Enable debug log output")
+	maxWorkers := flag.Int("workers", intEnv("MAX_WORKERS", 4), "Goroutine count for concurrent tests")
+	timeoutSecs := flag.Int("timeout", intEnv("NETWORK_TIMEOUT", 30), "Per-request timeout in seconds")
+	http2Flag := flag.Bool("http2", boolEnv("NETWORK_HTTP2"), "Use HTTP/2 for session transports (ignored with -api bolt)")
+	format := flag.String("format", env("OUTPUT_FORMAT", "table"), "Output format: table, json, or benchstat")
+	runsFlag := flag.Int("runs", intEnv("BENCH_RUNS", 1), "Number of independent runs (use with -format benchstat for confidence intervals)")
+	apiFlag := flag.String("api", env("NEO4J_API", "queryv2"), "API to benchmark: queryv2 (Neo4j Query API v2), legacy (Cypher HTTP Transaction API), or bolt (Neo4j Go Driver v6)")
+	modeFlag := flag.String("mode", env("NEO4J_ACCESS_MODE", "read"), "Access mode: read or write")
+	debugFlag := flag.Bool("debug", boolEnv("DEBUG"), "Enable debug log output")
 
-	neo4jURL        := flag.String("url", env("NEO4J_URL", "http://localhost:7474"), "Neo4j base URL")
-	neo4jUsr        := flag.String("usr", env("NEO4J_USERNAME", "neo4j"), "Neo4j username")
-	neo4jPwd        := flag.String("pwd", env("NEO4J_PASSWORD", "password"), "Neo4j password")
-	neo4jDB         := flag.String("db", env("NEO4J_DATABASE", "neo4j"), "Neo4j database name")
-	neo4jCypher     := flag.String("cypher", env("NEO4J_CYPHER", "RETURN 1"), "Cypher statement to benchmark")
-	queriesFile     := flag.String("queries-file", "", "TOML file of named queries (mutually exclusive with -cypher)")
+	neo4jURL := flag.String("url", env("NEO4J_URL", "http://localhost:7474"), "Neo4j base URL (bolt://... or neo4j://... when -api bolt)")
+	neo4jUsr := flag.String("usr", env("NEO4J_USERNAME", "neo4j"), "Neo4j username")
+	neo4jPwd := flag.String("pwd", env("NEO4J_PASSWORD", "password"), "Neo4j password")
+	neo4jDB := flag.String("db", env("NEO4J_DATABASE", "neo4j"), "Neo4j database name")
+	neo4jCypher := flag.String("cypher", env("NEO4J_CYPHER", "RETURN 1"), "Cypher statement to benchmark")
+	queriesFile := flag.String("queries-file", "", "TOML file of named queries (mutually exclusive with -cypher)")
 
 	flag.Parse()
 
-	if len(tests) == 0 {
-		fmt.Fprintf(os.Stderr, "Error: at least one -t <test> is required.\nAvailable: %s\n", strings.Join(available, ", "))
+	if *apiFlag != "queryv2" && *apiFlag != "legacy" && *apiFlag != "bolt" {
+		fmt.Fprintf(os.Stderr, "Error: -api must be \"queryv2\", \"legacy\", or \"bolt\"\n")
 		os.Exit(1)
 	}
-
-	for _, t := range tests {
-		if !isKnown(t) {
-			fmt.Fprintf(os.Stderr, "Error: unknown test %q. Available: %s\n", t, strings.Join(available, ", "))
-			os.Exit(1)
-		}
-	}
-
-	if *apiFlag != "queryv2" && *apiFlag != "legacy" {
-		fmt.Fprintf(os.Stderr, "Error: -api must be \"queryv2\" or \"legacy\"\n")
-		os.Exit(1)
-	}
+	kind := apiKind(*apiFlag)
 
 	if *modeFlag != "read" && *modeFlag != "write" {
 		fmt.Fprintf(os.Stderr, "Error: -mode must be \"read\" or \"write\"\n")
@@ -111,6 +90,33 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Warning: -runs %d has no effect with -format %s; use -format benchstat\n", *runsFlag, *format)
 	}
 
+	if kind == benchmarks.KindBolt {
+		if !hasBoltScheme(*neo4jURL) {
+			fmt.Fprintf(os.Stderr, "Error: -api bolt requires a bolt:// or neo4j:// -url (got %q); e.g. -url neo4j://localhost:7687\n", *neo4jURL)
+			os.Exit(1)
+		}
+		if *http2Flag {
+			fmt.Fprintf(os.Stderr, "Warning: -http2 has no effect with -api bolt; ignoring\n")
+		}
+	}
+
+	transactions, err := resolveTransactions(transactionFlag, kind)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	concurrencies, err := resolveConcurrencies(concurrencyFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	connections, err := resolveConnections(connectionFlag, kind)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	cases := testCases(transactions, concurrencies, connections)
+
 	if *queriesFile != "" {
 		var cypherExplicit bool
 		flag.Visit(func(f *flag.Flag) {
@@ -122,11 +128,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: -queries-file and -cypher are mutually exclusive\n")
 			os.Exit(1)
 		}
-	}
-
-	flavor := query.FlavorQueryV2
-	if *apiFlag == "legacy" {
-		flavor = query.FlavorLegacyHTTP
 	}
 
 	accessMode := query.AccessModeRead
@@ -151,7 +152,7 @@ func main() {
 		Database:   *neo4jDB,
 		Timeout:    timeout,
 		HTTP2:      *http2Flag,
-		Flavor:     flavor,
+		Kind:       kind,
 		AccessMode: accessMode,
 		Logger:     customLogger,
 		Config: runner.Config{
@@ -162,7 +163,7 @@ func main() {
 		},
 	}
 
-	label := apiLabel(flavor)
+	label := apiLabel(kind)
 	fmt.Fprintf(os.Stderr, "API: %s\n", label)
 
 	// Resolve the query list — either from a file or the single -cypher flag.
@@ -186,14 +187,15 @@ func main() {
 
 		var runEntries []results.Entry
 		for _, q := range queries {
-			for _, name := range tests {
+			for _, c := range cases {
+				name := benchmarks.DisplayName(kind, c.tx, c.conc, c.conn)
 				if q.Label != "" {
 					fmt.Fprintf(os.Stderr, "\nRunning %s [%s]...\n", name, q.Label)
 				} else {
 					fmt.Fprintf(os.Stderr, "\nRunning %s...\n", name)
 				}
 
-				result, err := dispatch(ctx, name, benchCfg, q.Cypher)
+				result, err := benchmarks.Run(ctx, benchCfg, q.Cypher, c.tx, c.conc, c.conn)
 				if err != nil {
 					log.Printf("ERROR %s: %v\n", name, err)
 					aborted++
@@ -237,46 +239,167 @@ func main() {
 	}
 }
 
-// dispatch routes a test name to the corresponding benchmark function.
-func dispatch(ctx context.Context, name string, cfg benchmarks.Config, cypher string) (runner.Result, error) {
-	switch name {
-	// Implicit
-	case "SyncImplicit":
-		return benchmarks.SyncImplicit(ctx, cfg, cypher)
-	case "SyncSessionsImplicit":
-		return benchmarks.SyncSessionsImplicit(ctx, cfg, cypher)
-	case "GoroutinesImplicit":
-		return benchmarks.GoroutinesImplicit(ctx, cfg, cypher)
-	case "GoroutinesSessionsImplicit":
-		return benchmarks.GoroutinesSessionsImplicit(ctx, cfg, cypher)
-	// Managed
-	case "Sync":
-		return benchmarks.Sync(ctx, cfg, cypher)
-	case "SyncSessions":
-		return benchmarks.SyncSessions(ctx, cfg, cypher)
-	case "Goroutines":
-		return benchmarks.Goroutines(ctx, cfg, cypher)
-	case "GoroutinesSessions":
-		return benchmarks.GoroutinesSessions(ctx, cfg, cypher)
-	default:
-		return runner.Result{}, fmt.Errorf("unknown test: %s", name)
-	}
+// testCase is one resolved (transaction, concurrency, connection) combination
+// to run — the cartesian product of the -transaction/-concurrency/-connection
+// flag values.
+type testCase struct {
+	tx   benchmarks.Transaction
+	conc benchmarks.Concurrency
+	conn benchmarks.Connection
 }
 
-func apiLabel(flavor query.APIFlavor) string {
-	if flavor == query.FlavorLegacyHTTP {
-		return "Legacy Cypher HTTP Transaction API (/db/{db}/tx/commit)"
+func testCases(txs []benchmarks.Transaction, concs []benchmarks.Concurrency, conns []benchmarks.Connection) []testCase {
+	cases := make([]testCase, 0, len(txs)*len(concs)*len(conns))
+	for _, tx := range txs {
+		for _, conc := range concs {
+			for _, conn := range conns {
+				cases = append(cases, testCase{tx: tx, conc: conc, conn: conn})
+			}
+		}
 	}
-	return "Neo4j Query API v2 (/db/{db}/query/v2)"
+	return cases
 }
 
-func isKnown(name string) bool {
-	for _, a := range available {
-		if a == name {
+var transactionValues = map[string]benchmarks.Transaction{
+	"implicit": benchmarks.TransactionImplicit,
+	"managed":  benchmarks.TransactionManaged,
+}
+var transactionAll = []benchmarks.Transaction{benchmarks.TransactionImplicit, benchmarks.TransactionManaged}
+
+var concurrencyValues = map[string]benchmarks.Concurrency{
+	"sequential": benchmarks.ConcurrencySequential,
+	"concurrent": benchmarks.ConcurrencyConcurrent,
+}
+var concurrencyAll = []benchmarks.Concurrency{benchmarks.ConcurrencySequential, benchmarks.ConcurrencyConcurrent}
+
+var connectionValues = map[string]benchmarks.Connection{
+	"fresh":  benchmarks.ConnectionFresh,
+	"pooled": benchmarks.ConnectionPooled,
+}
+var connectionAll = []benchmarks.Connection{benchmarks.ConnectionFresh, benchmarks.ConnectionPooled}
+
+// resolveTransactions expands -transaction into the set of styles to run.
+// It's required for the HTTP APIs (matching the old "-t is required"
+// strictness) but optional for bolt, which only ever runs implicit.
+func resolveTransactions(raw []string, kind benchmarks.Kind) ([]benchmarks.Transaction, error) {
+	if len(raw) == 0 {
+		if kind == benchmarks.KindBolt {
+			return []benchmarks.Transaction{benchmarks.TransactionImplicit}, nil
+		}
+		return nil, fmt.Errorf("at least one -transaction is required: implicit, managed, or all")
+	}
+	txs, err := expandValues(raw, "transaction", transactionValues, transactionAll)
+	if err != nil {
+		return nil, err
+	}
+	if kind == benchmarks.KindBolt && contains(txs, benchmarks.TransactionManaged) {
+		return nil, fmt.Errorf("-transaction managed is not supported with -api bolt: Bolt only runs the auto-commit implicit style via ExecuteQuery")
+	}
+	return txs, nil
+}
+
+// resolveConcurrencies expands -concurrency, defaulting to sequential when
+// unset. Concurrency applies identically to every backend.
+func resolveConcurrencies(raw []string) ([]benchmarks.Concurrency, error) {
+	if len(raw) == 0 {
+		return []benchmarks.Concurrency{benchmarks.ConcurrencySequential}, nil
+	}
+	return expandValues(raw, "concurrency", concurrencyValues, concurrencyAll)
+}
+
+// resolveConnections expands -connection. Bolt has no fresh-connection mode
+// (it always shares one pooled Driver), so it defaults to — and is
+// restricted to — pooled.
+func resolveConnections(raw []string, kind benchmarks.Kind) ([]benchmarks.Connection, error) {
+	if len(raw) == 0 {
+		if kind == benchmarks.KindBolt {
+			return []benchmarks.Connection{benchmarks.ConnectionPooled}, nil
+		}
+		return []benchmarks.Connection{benchmarks.ConnectionFresh}, nil
+	}
+	conns, err := expandValues(raw, "connection", connectionValues, connectionAll)
+	if err != nil {
+		return nil, err
+	}
+	if kind == benchmarks.KindBolt && contains(conns, benchmarks.ConnectionFresh) {
+		return nil, fmt.Errorf("-connection fresh is not supported with -api bolt: Bolt always uses one shared, pooled Driver — recreating a Driver per request isn't real usage")
+	}
+	return conns, nil
+}
+
+// expandValues parses repeated flag values — each either a literal option or
+// the shorthand "all" — into a deduplicated, order-preserving slice.
+func expandValues[T comparable](raw []string, axis string, values map[string]T, all []T) ([]T, error) {
+	var out []T
+	seen := make(map[T]bool)
+	add := func(v T) {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	for _, r := range raw {
+		if r == "all" {
+			for _, v := range all {
+				add(v)
+			}
+			continue
+		}
+		v, ok := values[r]
+		if !ok {
+			return nil, fmt.Errorf("unknown -%s value %q", axis, r)
+		}
+		add(v)
+	}
+	return out, nil
+}
+
+func contains[T comparable](s []T, v T) bool {
+	for _, x := range s {
+		if x == v {
 			return true
 		}
 	}
 	return false
+}
+
+func apiKind(api string) benchmarks.Kind {
+	switch api {
+	case "legacy":
+		return benchmarks.KindLegacy
+	case "bolt":
+		return benchmarks.KindBolt
+	default:
+		return benchmarks.KindQueryV2
+	}
+}
+
+func apiLabel(kind benchmarks.Kind) string {
+	switch kind {
+	case benchmarks.KindLegacy:
+		return "Legacy Cypher HTTP Transaction API (/db/{db}/tx/commit)"
+	case benchmarks.KindBolt:
+		return "Neo4j Go Driver v6 (Bolt)"
+	default:
+		return "Neo4j Query API v2 (/db/{db}/query/v2)"
+	}
+}
+
+// hasBoltScheme reports whether rawURL uses a Bolt-family scheme
+// (bolt/bolt+s/bolt+ssc/neo4j/neo4j+s/neo4j+ssc). An http(s):// URL against
+// the driver fails with a confusing low-level error, so this is checked
+// up front.
+func hasBoltScheme(rawURL string) bool {
+	i := strings.Index(rawURL, "://")
+	if i < 0 {
+		return false
+	}
+	switch rawURL[:i] {
+	case "bolt", "bolt+s", "bolt+ssc", "neo4j", "neo4j+s", "neo4j+ssc":
+		return true
+	default:
+		return false
+	}
 }
 
 func intEnv(key string, fallback int) int {

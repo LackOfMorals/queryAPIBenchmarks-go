@@ -1,12 +1,14 @@
 # queryAPIBenchmarks-go
 
-A Go port of [queryAPIBenchmarks](https://github.com/LackOfMorals/queryAPIBenchmarks), using the
-[query-go-sdk](https://github.com/neo4j-contrib/query-go-sdk) to benchmark the Neo4j Query API.
+A Go port of [queryAPIBenchmarks](https://github.com/LackOfMorals/queryAPIBenchmarks), benchmarking
+three ways to talk to Neo4j: the Query API v2 and Legacy HTTP Transaction API via
+[query-go-sdk](https://github.com/neo4j-contrib/query-go-sdk), and Bolt via the official
+[neo4j-go-driver/v6](https://github.com/neo4j/neo4j-go-driver).
 
 ## Requirements
 
 - Go 1.23+
-- A running Neo4j instance or Aura database
+- A running Neo4j instance or Aura database — with its Bolt port (default `7687`) reachable if using `-api bolt`
 
 ## Installation
 
@@ -29,7 +31,7 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 
 | Environment variable | Flag        | Default              | Description                                      |
 |----------------------|-------------|----------------------|--------------------------------------------------|
-| `NEO4J_URL`          | `-url`      | `http://localhost:7474` | Query API base URL                            |
+| `NEO4J_URL`          | `-url`      | `http://localhost:7474` | Base URL (`bolt://`/`neo4j://` when `-api bolt`) |
 | `NEO4J_USERNAME`     | `-usr`      | `neo4j`              | Username                                         |
 | `NEO4J_PASSWORD`     | `-pwd`      | _(empty)_            | Password                                         |
 | `NEO4J_DATABASE`     | `-db`       | `neo4j`              | Database name                                    |
@@ -38,40 +40,47 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 | `WARMUP_REQUESTS`    | `-warmup`   | `5`                  | Warmup iterations before timing (0 to skip)      |
 | `MAX_WORKERS`        | `-workers`  | `4`                  | Goroutines for concurrent tests                  |
 | `NETWORK_TIMEOUT`    | `-timeout`  | `30`                 | Per-request timeout (seconds)                    |
-| `NETWORK_HTTP2`      | `-http2`    | `0`                  | Use HTTP/2 for session transports (requires https) |
+| `NETWORK_HTTP2`      | `-http2`    | `0`                  | Use HTTP/2 for session transports (requires https; ignored with `-api bolt`) |
 | `OUTPUT_FORMAT`      | `-format`   | `table`              | Output format: `table` or `json`                 |
-| `NEO4J_API`          | `-api`      | `queryv2`            | API to target: `queryv2` or `legacy`             |
+| `NEO4J_API`          | `-api`      | `queryv2`            | Backend to target: `queryv2`, `legacy`, or `bolt` |
+| —                    | `-transaction` | _(required, unless `-api bolt`)_ | Transaction style (repeatable): `implicit`, `managed`, or `all` |
+| —                    | `-concurrency` | `sequential`      | Concurrency (repeatable): `sequential`, `concurrent`, or `all` |
+| —                    | `-connection`  | `fresh`           | HTTP connection reuse (repeatable): `fresh`, `pooled`, or `all` — not applicable to `-api bolt` |
 
 ## Usage
 
 ```bash
-# Single test
-./bench -t SyncImplicit
+# Single test: implicit transaction, sequential, fresh connection per request
+./bench -transaction implicit
 
-# Multiple tests in one run (results table covers all)
-./bench -t SyncImplicit -t SyncSessionsImplicit -t GoroutinesImplicit -t GoroutinesSessionsImplicit
+# Every combination of concurrency and connection reuse for implicit
+# transactions in one run (results table covers all four)
+./bench -transaction implicit -concurrency all -connection all
 
-# All implicit tests with 100 requests, 10 goroutines
-./bench -t SyncImplicit -t SyncSessionsImplicit \
-        -t GoroutinesImplicit -t GoroutinesSessionsImplicit \
-        -n 100 -workers 10
+# Same sweep, 100 requests, 10 goroutines for the concurrent cases
+./bench -transaction implicit -concurrency all -connection all -n 100 -workers 10
 
-# All managed transaction tests
-./bench -t Sync -t SyncSessions -t Goroutines -t GoroutinesSessions -n 100
+# All managed-transaction tests (explicit begin -> execute -> commit)
+./bench -transaction managed -concurrency all -connection all -n 100
 
 # Skip warmup
-./bench -t SyncImplicit -warmup 0
+./bench -transaction implicit -warmup 0
 
 # JSON output (stdout is clean; progress goes to stderr)
-./bench -t SyncImplicit -t GoroutinesSessionsImplicit -n 100 -format json
-./bench -t SyncImplicit -n 100 -format json 2>/dev/null | python3 -m json.tool
+./bench -transaction implicit -concurrency all -n 100 -format json
+./bench -transaction implicit -n 100 -format json 2>/dev/null | python3 -m json.tool
 
 # Target the legacy Cypher HTTP Transaction API (/db/{db}/tx/commit)
-./bench -t SyncImplicit -api legacy -n 100
+./bench -transaction implicit -api legacy -n 100
 
-# Side-by-side API comparison
-./bench -t SyncImplicit -t SyncSessionsImplicit -n 100 -api queryv2 -format json > v2.json
-./bench -t SyncImplicit -t SyncSessionsImplicit -n 100 -api legacy  -format json > legacy.json
+# Target the official Bolt driver (v6) — no -transaction/-connection needed,
+# Bolt only runs the auto-commit implicit style over one pooled Driver
+./bench -api bolt -url neo4j://localhost:7687 -concurrency all -n 100
+
+# Side-by-side backend comparison
+./bench -transaction implicit -connection all -n 100 -api queryv2 -format json > v2.json
+./bench -transaction implicit -connection all -n 100 -api legacy  -format json > legacy.json
+./bench -concurrency all -n 100 -api bolt -url neo4j://localhost:7687 -format json > bolt.json
 ```
 
 ## Output
@@ -83,17 +92,22 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 Test                              Time (s)   Req/s     Failures
   min       p50       p95       p99       max     stddev
 --------------------------------------------------------------------
-SyncImplicit                      1.234      81        0 / 50
+implicit/sequential/fresh          1.234      81        0 / 50
   10.20ms   12.10ms   15.30ms   18.20ms   22.40ms 1.80ms
 --------------------------------------------------------------------
 ```
+
+Each test's name is the composite of the axes it ran with —
+`<transaction>/<concurrency>/<connection>` (HTTP) or
+`<transaction>/<concurrency>` (Bolt, which has no connection axis) — so the
+table is self-describing without a lookup table.
 
 ### JSON format (`-format json`)
 
 ```json
 [
   {
-    "name": "SyncImplicit",
+    "name": "implicit/sequential/fresh",
     "total_seconds": 1.234,
     "request_count": 50,
     "failure_count": 0,
@@ -125,45 +139,61 @@ The JSON envelope includes an `api_flavor` key so output files are self-describi
 
 ## API flavors
 
-Use `-api` to select which Neo4j HTTP API the benchmarks target:
+Use `-api` to select which Neo4j access backend the benchmarks target:
 
-| Value | Endpoint | Notes |
+| Value | Transport | Notes |
 |---|---|---|
-| `queryv2` _(default)_ | `/db/{db}/query/v2` | Modern Query API; typed JSON responses |
-| `legacy` | `/db/{db}/tx/commit` (implicit) / `/db/{db}/tx` (managed) | Legacy Cypher HTTP Transaction API |
+| `queryv2` _(default)_ | HTTP `/db/{db}/query/v2` | Modern Query API; typed JSON responses |
+| `legacy` | HTTP `/db/{db}/tx/commit` (implicit) / `/db/{db}/tx` (managed) | Legacy Cypher HTTP Transaction API |
+| `bolt` | Bolt, via the official [neo4j-go-driver/v6](https://github.com/neo4j/neo4j-go-driver) | Native driver; connects with `bolt://` or `neo4j://` |
 
-All eight benchmarks work with both flavors. The selected API is printed to stderr before any test runs.
+The selected backend is printed to stderr before any test runs.
 
-> **Note:** `legacy` requires Neo4j 4.x or later with the HTTP transaction API enabled. Aura instances use `queryv2`.
+> **Note:** `legacy` requires Neo4j 4.x or later with the HTTP transaction API enabled. Aura instances use `queryv2`. `bolt` requires `-url` to use a `bolt://`/`neo4j://` scheme, not `http://`.
 
 ## Available tests
 
-### Implicit transactions
-A single HTTP call per iteration; the Query API manages the transaction.
+Every test is described by up to three orthogonal flags, and a run sweeps
+the cartesian product of whatever values you pass:
 
-| Test name                    | Transport       | Concurrency  |
-|------------------------------|-----------------|--------------|
-| `SyncImplicit`               | Fresh conn      | Sequential   |
-| `SyncSessionsImplicit`       | Persistent conn | Sequential   |
-| `GoroutinesImplicit`         | Fresh conn      | Concurrent   |
-| `GoroutinesSessionsImplicit` | Persistent conn | Concurrent   |
+| Flag | Values | Meaning |
+|---|---|---|
+| `-transaction` | `implicit`, `managed` | `implicit`: one HTTP call per iteration, the API manages the transaction. `managed`: three HTTP calls per iteration — begin → execute → commit. |
+| `-concurrency` | `sequential`, `concurrent` | Sequential loop vs. a goroutine pool (`-workers`). |
+| `-connection` | `fresh`, `pooled` | `fresh`: new TCP connection per request. `pooled`: keep-alive connection reuse (+ optional `-http2`). |
 
-### Managed transactions
-Three HTTP calls per iteration: begin → execute → commit.
+For example, `-transaction implicit -concurrency concurrent -connection pooled`
+is what used to be called `GoroutinesSessionsImplicit`; the same run now
+prints as `implicit/concurrent/pooled`. Passing `all` for any flag (or the
+flag more than once) runs every value on that axis in the same invocation.
 
-| Test name           | Transport       | Concurrency  |
-|---------------------|-----------------|--------------|
-| `Sync`              | Fresh conn      | Sequential   |
-| `SyncSessions`      | Persistent conn | Sequential   |
-| `Goroutines`        | Fresh conn      | Concurrent   |
-| `GoroutinesSessions`| Persistent conn | Concurrent   |
+### Bolt (`-api bolt`) is narrower by design
+
+Per the [Go Driver Manual's performance recommendations](https://neo4j.com/docs/go-manual/current/performance/),
+a `Session`/explicit transaction only pays off when batching several
+queries into one transaction or lazily streaming a huge result — neither
+applies to a benchmark that runs exactly one eagerly-loaded statement per
+iteration. So Bolt:
+
+- **only runs `-transaction implicit`**, via `neo4j.ExecuteQuery` against one
+  shared, pooled `Driver` — passing `-transaction managed` errors out.
+- **has no `-connection` axis** — Bolt always pools via its `Driver`, so
+  passing `-connection fresh` errors out (there is no "fresh" mode to
+  benchmark).
+- **ignores `-http2`** (the driver handles its own multiplexing) — passing it
+  prints a warning rather than an error, since it's harmless.
+
+`-concurrency` still applies normally: `./bench -api bolt -concurrency all`
+runs both `implicit/sequential` and `implicit/concurrent`.
 
 ## Project layout
 
 ```
 queryAPIBenchmarks-go/
-├── cmd/bench/main.go           # CLI entry point
-├── benchmarks/benchmarks.go    # All eight benchmark implementations
+├── cmd/bench/main.go           # CLI entry point: flags, axis expansion, dispatch
+├── benchmarks/
+│   ├── benchmarks.go           # Client interface + HTTP (Query API v2 / Legacy) implementations
+│   └── bolt.go                 # Bolt (neo4j-go-driver/v6) Client implementation
 ├── internal/
 │   ├── managed/
 │   │   └── managed.go          # Raw HTTP managed-transaction client (begin/execute/commit)

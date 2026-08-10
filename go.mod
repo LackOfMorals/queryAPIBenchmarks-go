@@ -6,6 +6,7 @@ require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/neo4j-contrib/query-go-sdk v0.3.0
+	github.com/neo4j/neo4j-go-driver/v6 v6.2.0
 	golang.org/x/net v0.56.0
 	golang.org/x/term v0.44.0
 )
