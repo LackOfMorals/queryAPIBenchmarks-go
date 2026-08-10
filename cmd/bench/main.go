@@ -69,6 +69,7 @@ func main() {
 	format         := flag.String("format", env("OUTPUT_FORMAT", "table"), "Output format: table, json, or benchstat")
 	runsFlag       := flag.Int("runs", intEnv("BENCH_RUNS", 1), "Number of independent runs (use with -format benchstat for confidence intervals)")
 	apiFlag        := flag.String("api", env("NEO4J_API", "queryv2"), "API to benchmark: queryv2 (Neo4j Query API v2) or legacy (Cypher HTTP Transaction API)")
+	modeFlag       := flag.String("mode", env("NEO4J_ACCESS_MODE", "read"), "Access mode: read or write")
 	debugFlag      := flag.Bool("debug", boolEnv("DEBUG"), "Enable debug log output")
 
 	neo4jURL        := flag.String("url", env("NEO4J_URL", "http://localhost:7474"), "Neo4j base URL")
@@ -94,6 +95,11 @@ func main() {
 
 	if *apiFlag != "queryv2" && *apiFlag != "legacy" {
 		fmt.Fprintf(os.Stderr, "Error: -api must be \"queryv2\" or \"legacy\"\n")
+		os.Exit(1)
+	}
+
+	if *modeFlag != "read" && *modeFlag != "write" {
+		fmt.Fprintf(os.Stderr, "Error: -mode must be \"read\" or \"write\"\n")
 		os.Exit(1)
 	}
 
@@ -123,6 +129,11 @@ func main() {
 		flavor = query.FlavorLegacyHTTP
 	}
 
+	accessMode := query.AccessModeRead
+	if *modeFlag == "write" {
+		accessMode = query.AccessModeWrite
+	}
+
 	level := slog.LevelInfo
 	if *debugFlag {
 		level = slog.LevelDebug
@@ -134,14 +145,15 @@ func main() {
 	timeout := time.Duration(*timeoutSecs) * time.Second
 
 	benchCfg := benchmarks.Config{
-		URL:      *neo4jURL,
-		Username: *neo4jUsr,
-		Password: *neo4jPwd,
-		Database: *neo4jDB,
-		Timeout:  timeout,
-		HTTP2:    *http2Flag,
-		Flavor:   flavor,
-		Logger:   customLogger,
+		URL:        *neo4jURL,
+		Username:   *neo4jUsr,
+		Password:   *neo4jPwd,
+		Database:   *neo4jDB,
+		Timeout:    timeout,
+		HTTP2:      *http2Flag,
+		Flavor:     flavor,
+		AccessMode: accessMode,
+		Logger:     customLogger,
 		Config: runner.Config{
 			Requests:       *numRequests,
 			WarmupRequests: *warmupRequests,
@@ -163,6 +175,10 @@ func main() {
 	ctx := context.Background()
 	var entries []results.Entry
 
+	// A benchmark that could not run at all (warmup failed, target unreachable)
+	// must not exit 0 — otherwise a scheduled or scripted run looks successful.
+	var aborted int
+
 	for run := range *runsFlag {
 		if *runsFlag > 1 {
 			fmt.Fprintf(os.Stderr, "\n=== Run %d/%d ===\n", run+1, *runsFlag)
@@ -180,7 +196,17 @@ func main() {
 				result, err := dispatch(ctx, name, benchCfg, q.Cypher)
 				if err != nil {
 					log.Printf("ERROR %s: %v\n", name, err)
+					aborted++
 					continue
+				}
+
+				// A run where every request failed is not a result. Without this
+				// the table shows "0 / 50", an asterisk, and exit code 0 — which a
+				// scheduled job reads as success. The warmup guard alone doesn't
+				// cover it, since -warmup 0 skips warmup entirely.
+				if result.RequestCount > 0 && result.SuccessCount == 0 {
+					log.Printf("ERROR %s: all %d requests failed", name, result.RequestCount)
+					aborted++
 				}
 
 				runEntries = append(runEntries, results.Entry{Name: name, QueryLabel: q.Label, Result: result})
@@ -203,6 +229,11 @@ func main() {
 		default:
 			results.PrintTable(entries, label)
 		}
+	}
+
+	if aborted > 0 {
+		fmt.Fprintf(os.Stderr, "\n%d benchmark(s) could not run.\n", aborted)
+		os.Exit(1)
 	}
 }
 

@@ -1,0 +1,8 @@
+
+docker run -dt --name haproxy01 \
+--network host \
+--volume=$HOME/haproxy01:/usr/local/etc/haproxy:rw \
+--user="$(id -u):$(id -g)" \
+--restart=always \
+haproxy:alpine
+

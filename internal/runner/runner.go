@@ -13,6 +13,24 @@ import (
 // It receives a context so callers can respect deadlines and cancellations.
 type TxFunc func(ctx context.Context) error
 
+// warmupFailureRatio is the fraction of failed warmup requests above which the
+// run is abandoned rather than measured. A benchmark against an unreachable or
+// unhealthy cluster should fail loudly, not report timings for nothing.
+const warmupFailureRatio = 0.10
+
+// warmupFailureFloor is the minimum number of warmup failures needed to abort,
+// regardless of ratio.
+//
+// Without it the default -warmup 5 makes a single transient blip fatal
+// (1 > 0.10*5), discarding the whole run and exiting non-zero. The ratio should
+// only take over once the sample is big enough for it to mean something.
+const warmupFailureFloor = 2
+
+// jobBufferMax bounds the dispatch channel. The original pre-filled a channel
+// with one token per request before starting, which is fine for n=100 and
+// wasteful for n=10,000,000.
+const jobBufferMax = 1024
+
 // Config controls how a benchmark run behaves.
 type Config struct {
 	// Name is printed in progress output.
@@ -39,7 +57,7 @@ func Run(ctx context.Context, cfg Config, fn TxFunc) (Result, error) {
 	if err := warmup(ctx, cfg, fn); err != nil {
 		return Result{}, err
 	}
-	return measure(ctx, cfg, fn, false)
+	return measure(ctx, cfg, fn, 1)
 }
 
 // RunConcurrent executes fn with cfg.Workers goroutines in parallel, preceded
@@ -48,122 +66,212 @@ func RunConcurrent(ctx context.Context, cfg Config, fn TxFunc) (Result, error) {
 	if err := warmup(ctx, cfg, fn); err != nil {
 		return Result{}, err
 	}
-	return measure(ctx, cfg, fn, true)
+
+	workers := cfg.Workers
+	if workers <= 0 {
+		workers = cfg.Requests // unbounded — one goroutine per request
+	}
+	if workers > cfg.Requests {
+		workers = cfg.Requests
+	}
+	return measure(ctx, cfg, fn, workers)
 }
 
 // warmup runs fn for cfg.WarmupRequests iterations without timing.
+//
+// It aborts the benchmark when more than warmupFailureRatio of warmup requests
+// fail. Previously warmup only printed a warning, so a completely unreachable
+// target still produced a results table.
 func warmup(ctx context.Context, cfg Config, fn TxFunc) error {
 	if cfg.WarmupRequests <= 0 {
 		return nil
 	}
 
-	fmt.Fprintf(os.Stderr, "Warmup: %s [0/%d]\r", cfg.Name, cfg.WarmupRequests)
+	var done atomic.Int64
+	p := startProgress(os.Stderr, "Warmup "+cfg.Name, cfg.WarmupRequests, &done)
 
-	for i := range cfg.WarmupRequests {
+	var failures int
+	var lastErr error
+
+	for range cfg.WarmupRequests {
 		reqCtx, cancel := requestContext(ctx, cfg.Timeout)
 		err := fn(reqCtx)
 		cancel()
 
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: warmup request %d failed: %v\n", i+1, err)
+			failures++
+			lastErr = err
 		}
-
-		fmt.Fprintf(os.Stderr, "Warmup: %s [%d/%d]\r", cfg.Name, i+1, cfg.WarmupRequests)
+		done.Add(1)
 	}
+	p.Stop()
 
-	fmt.Fprintf(os.Stderr, "Warmup: %s done             \n", cfg.Name)
+	if failures >= warmupFailureFloor && float64(failures) > warmupFailureRatio*float64(cfg.WarmupRequests) {
+		return fmt.Errorf("warmup failed: %d/%d requests errored, last error: %w",
+			failures, cfg.WarmupRequests, lastErr)
+	}
+	if failures > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: %d/%d warmup requests failed (last: %v)\n",
+			failures, cfg.WarmupRequests, lastErr)
+	}
 	return nil
 }
 
-// measure runs the timed benchmark phase, sequential or concurrent.
-func measure(ctx context.Context, cfg Config, fn TxFunc, concurrent bool) (Result, error) {
-	var failures atomic.Int64
+// shard is one worker's private accumulator. Per-worker shards merged at the
+// end avoid any shared mutable state on the request path, so adding workers
+// doesn't introduce lock contention that would show up as server latency.
+type shard struct {
+	success []time.Duration
+	failure []time.Duration
+	errors  map[string]int
+	samples []string
+}
 
-	if !concurrent {
-		fmt.Fprintf(os.Stderr, "%s [0/%d]\r", cfg.Name, cfg.Requests)
+func (s *shard) record(d time.Duration, err error) {
+	if err == nil {
+		s.success = append(s.success, d)
+		return
+	}
 
-		durations := make([]time.Duration, 0, cfg.Requests)
+	// Failed requests are kept apart from successful ones. A request that hit a
+	// 30s timeout is not a latency observation, and counting it as throughput
+	// makes a broken run look healthy.
+	s.failure = append(s.failure, d)
+	s.errors[classify(err)]++
+	if len(s.samples) < maxErrorSamples {
+		s.samples = append(s.samples, err.Error())
+	}
+}
+
+// measure runs the timed phase with the given number of workers.
+// workers == 1 takes a channel-free path.
+func measure(ctx context.Context, cfg Config, fn TxFunc, workers int) (Result, error) {
+	if workers < 1 {
+		workers = 1
+	}
+
+	shards := make([]shard, workers)
+	perShard := cfg.Requests/workers + 1
+	for i := range shards {
+		shards[i].success = make([]time.Duration, 0, perShard)
+		shards[i].errors = make(map[string]int)
+	}
+
+	var done atomic.Int64
+	p := startProgress(os.Stderr, cfg.Name, cfg.Requests, &done)
+
+	// One iteration: time fn, record, bump the progress counter.
+	run := func(s *shard) {
+		reqCtx, cancel := requestContext(ctx, cfg.Timeout)
+		reqStart := time.Now()
+		err := fn(reqCtx)
+		elapsed := time.Since(reqStart)
+		cancel()
+
+		s.record(elapsed, err)
+		done.Add(1)
+	}
+
+	var elapsed time.Duration
+
+	if workers == 1 {
+		s := &shards[0]
 		start := time.Now()
+		for range cfg.Requests {
+			run(s)
+		}
+		elapsed = time.Since(start)
+	} else {
+		jobs := make(chan struct{}, min(cfg.Requests, jobBufferMax))
 
-		for i := range cfg.Requests {
-			reqCtx, cancel := requestContext(ctx, cfg.Timeout)
-			reqStart := time.Now()
-			err := fn(reqCtx)
-			durations = append(durations, time.Since(reqStart))
-			cancel()
-
-			if err != nil {
-				failures.Add(1)
-				fmt.Fprintf(os.Stderr, "Warning: request %d failed: %v\n", i+1, err)
-			}
-
-			fmt.Fprintf(os.Stderr, "%s [%d/%d]\r", cfg.Name, i+1, cfg.Requests)
+		var wg sync.WaitGroup
+		for w := range workers {
+			wg.Add(1)
+			go func(s *shard) {
+				defer wg.Done()
+				for range jobs {
+					run(s)
+				}
+			}(&shards[w])
 		}
 
-		elapsed := time.Since(start)
-		fmt.Fprintf(os.Stderr, "%s done             \n", cfg.Name)
+		start := time.Now()
+		for range cfg.Requests {
+			jobs <- struct{}{}
+		}
+		close(jobs)
 
-		return Result{
-			TotalSeconds: elapsed.Seconds(),
-			RequestCount: cfg.Requests,
-			FailureCount: int(failures.Load()),
-			Durations:    durations,
-		}, nil
+		wg.Wait()
+		elapsed = time.Since(start)
 	}
 
-	// Concurrent path: fan out cfg.Requests jobs across cfg.Workers goroutines.
-	workers := cfg.Workers
-	if workers <= 0 {
-		workers = cfg.Requests // unbounded — one goroutine per request
+	p.Stop()
+
+	return mergeShards(shards, cfg.Requests, elapsed), nil
+}
+
+// mergeShards flattens per-worker accumulators into a single Result.
+func mergeShards(shards []shard, attempted int, elapsed time.Duration) Result {
+	var nSuccess, nFailure int
+	for i := range shards {
+		nSuccess += len(shards[i].success)
+		nFailure += len(shards[i].failure)
 	}
 
-	jobs := make(chan struct{}, cfg.Requests)
-	for range cfg.Requests {
-		jobs <- struct{}{}
-	}
-	close(jobs)
-
-	var wg sync.WaitGroup
-	var completed atomic.Int64
-
-	// Pre-allocate; each goroutine writes to its own index via the atomic counter.
-	durations := make([]time.Duration, cfg.Requests)
-
-	fmt.Fprintf(os.Stderr, "%s [0/%d]\r", cfg.Name, cfg.Requests)
-
-	start := time.Now()
-
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for range jobs {
-				reqCtx, cancel := requestContext(ctx, cfg.Timeout)
-				reqStart := time.Now()
-				err := fn(reqCtx)
-				elapsed := time.Since(reqStart)
-				cancel()
-				if err != nil {
-					failures.Add(1)
-				}
-				done := completed.Add(1)
-				durations[done-1] = elapsed
-				fmt.Fprintf(os.Stderr, "%s [%d/%d]\r", cfg.Name, done, cfg.Requests)
-			}
-		}()
-	}
-
-	wg.Wait()
-	elapsed := time.Since(start)
-
-	fmt.Fprintf(os.Stderr, "%s done             \n", cfg.Name)
-
-	return Result{
+	res := Result{
 		TotalSeconds: elapsed.Seconds(),
-		RequestCount: cfg.Requests,
-		FailureCount: int(failures.Load()),
-		Durations:    durations,
-	}, nil
+		RequestCount: attempted,
+		SuccessCount: nSuccess,
+		FailureCount: nFailure,
+		Durations:    make([]time.Duration, 0, nSuccess),
+		Errors:       make(map[string]int),
+	}
+	if nFailure > 0 {
+		res.FailureDurations = make([]time.Duration, 0, nFailure)
+	}
+
+	for i := range shards {
+		res.Durations = append(res.Durations, shards[i].success...)
+		res.FailureDurations = append(res.FailureDurations, shards[i].failure...)
+		for class, n := range shards[i].errors {
+			res.Errors[class] += n
+		}
+	}
+
+	res.ErrorSamples = collectSamples(shards)
+	return res
+}
+
+// mergedSampleCap bounds how many verbatim error strings reach the report.
+const mergedSampleCap = 8
+
+// collectSamples gathers error samples round-robin across shards, skipping
+// duplicates.
+//
+// Taking the first N from a flat concatenation would only ever surface the
+// lowest-indexed worker's errors — so with eight workers hitting three distinct
+// failure modes, you would see just one of them.
+func collectSamples(shards []shard) []string {
+	var out []string
+	seen := make(map[string]bool)
+
+	for round := range maxErrorSamples {
+		for i := range shards {
+			if len(out) >= mergedSampleCap {
+				return out
+			}
+			if round >= len(shards[i].samples) {
+				continue
+			}
+			s := shards[i].samples[round]
+			if seen[s] {
+				continue
+			}
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // requestContext returns a child context and its cancel func when a per-request

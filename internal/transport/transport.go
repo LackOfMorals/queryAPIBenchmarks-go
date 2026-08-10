@@ -16,13 +16,53 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// idleConnTimeout is how long an unused pooled connection is kept.
+//
+// This must stay BELOW the load balancer's keep-alive idle timeout
+// (HAProxy: timeout http-keep-alive, 30s in the reviewed config). If the client
+// holds connections longer than the proxy does, HAProxy closes them first and
+// the client hands out a dead connection — which surfaces as a sporadic EOF
+// that Go will not retry for a POST with a body.
+const idleConnTimeout = 20 * time.Second
+
+// minPoolSize floors the connection pool so the sequential modes, which have a
+// concurrency of 1, still keep a reasonable pool.
+const minPoolSize = 100
+
+// poolSize derives the connection pool size from the benchmark's concurrency.
+//
+// Go's default MaxIdleConnsPerHost is 2, and the previous hardcoded 100 was
+// fine at 4 workers but became a silent ceiling above that: surplus connections
+// were closed rather than pooled, so every request past the limit paid a fresh
+// TCP (and TLS) handshake. The resulting throughput plateau looks exactly like
+// server saturation.
+func poolSize(concurrency int) int {
+	n := concurrency * 2
+	if n < minPoolSize {
+		return minPoolSize
+	}
+	return n
+}
+
+// noHTTP2 makes HTTP/2 negotiation explicit rather than ambient. A plain
+// &http.Transport{} will opportunistically negotiate h2 over TLS, which would
+// mean -http2=0 silently ran HTTP/2 against an https:// URL.
+func noHTTP2() map[string]func(string, *tls.Conn) http.RoundTripper {
+	return map[string]func(string, *tls.Conn) http.RoundTripper{}
+}
+
 // NewFresh returns an http.Client that opens a new TCP connection for every
 // request, matching the Python TXrequest / Sync / Threads behaviour.
+//
+// Note this mode measures connection setup as much as query execution: over a
+// high-latency link it costs an extra round trip per request, and a large
+// response additionally pays TCP slow start on every single call.
 func NewFresh(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
 			DisableKeepAlives: true,
+			TLSNextProto:      noHTTP2(),
 		},
 	}
 }
@@ -30,13 +70,19 @@ func NewFresh(timeout time.Duration) *http.Client {
 // NewSession returns an http.Client that reuses connections across requests
 // (keep-alives on), matching the Python TXsession / SyncSessions /
 // ThreadsSessions behaviour.
-func NewSession(timeout time.Duration) *http.Client {
+//
+// concurrency is the number of goroutines that will share this client; the
+// connection pool is sized from it.
+func NewSession(timeout time.Duration, concurrency int) *http.Client {
+	n := poolSize(concurrency)
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:        n,
+			MaxIdleConnsPerHost: n,
+			MaxConnsPerHost:     0, // unlimited: let the server be the limit, not the client
+			IdleConnTimeout:     idleConnTimeout,
+			TLSNextProto:        noHTTP2(),
 		},
 	}
 }
@@ -46,8 +92,18 @@ func NewSession(timeout time.Duration) *http.Client {
 //
 // Note: HTTP/2 requires TLS in practice; plain-text h2c is not attempted here.
 // Point the benchmark at an https:// URL when using this transport.
-func NewSessionHTTP2(timeout time.Duration) (*http.Client, error) {
+//
+// The idle-connection settings matter far less here: HTTP/2 multiplexes all
+// requests to a host over one connection, so concurrency is bounded by the
+// server's SETTINGS_MAX_CONCURRENT_STREAMS rather than by the pool. Neo4j
+// behind HAProxy in HTTP/2 mode typically advertises 100.
+func NewSessionHTTP2(timeout time.Duration, concurrency int) (*http.Client, error) {
+	n := poolSize(concurrency)
 	t := &http.Transport{
+		MaxIdleConns:        n,
+		MaxIdleConnsPerHost: n,
+		IdleConnTimeout:     idleConnTimeout,
+		ForceAttemptHTTP2:   true,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
