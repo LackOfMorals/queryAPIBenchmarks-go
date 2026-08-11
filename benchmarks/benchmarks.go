@@ -147,7 +147,7 @@ func DisplayName(kind Kind, tx Transaction, conc Concurrency, conn Connection) s
 // the work, since a given run only ever needs one combination.
 func newClient(cfg Config, tx Transaction, conn Connection, concurrency int) (Client, error) {
 	if cfg.Kind == KindBolt {
-		return newBoltClient(cfg)
+		return newBoltClient(cfg, concurrency)
 	}
 	if tx == TransactionManaged {
 		return newManagedHTTPClient(cfg, conn, concurrency)

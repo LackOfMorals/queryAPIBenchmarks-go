@@ -199,6 +199,33 @@ iteration. So Bolt:
 `-concurrency` still applies normally: `./bench -api bolt -concurrency all`
 runs both `implicit/sequential` and `implicit/concurrent`.
 
+### Comparing legacy/queryv2/bolt fairly
+
+Two things affect a close three-way comparison that aren't bugs, just
+properties of how each backend actually works — worth knowing before reading
+too much into a small delta:
+
+- **`-bolt-scheme neo4j` (the default) bypasses the load balancer** for
+  everything after the initial connection: the driver fetches a routing
+  table and talks directly to cluster members from then on, while
+  `queryv2`/`legacy` go through the LB on every single call. Some of any
+  Bolt-vs-HTTP gap is that extra hop and proxy processing, not the wire
+  protocol. To measure Bolt through the LB the same way HTTP is measured,
+  use `-bolt-scheme bolt` (no client-side routing, one fixed address) instead
+  — comparing both scheme's results decomposes "LB overhead" from "protocol
+  difference."
+- **`-transaction implicit` on `-api queryv2` cannot currently read-route.**
+  That path delegates to [query-go-sdk](https://github.com/neo4j-contrib/query-go-sdk),
+  which sends Query API v2's access-mode hint as an `accessMode` HTTP
+  header; the server only reads it from the JSON body
+  (https://neo4j.com/docs/query-api/current/routing/), so the header is
+  silently ignored and reads may all land on the leader regardless of
+  `-mode`. `-transaction managed` on `queryv2` doesn't have this problem —
+  `internal/managed` sends it correctly in the body — so prefer `managed`
+  over `implicit` for any comparison where read-routing across the 3 nodes
+  matters. (Bolt's `ExecuteQueryWithReadersRouting`/`WritersRouting` is a
+  protocol-level driver feature and is unaffected either way.)
+
 ## Project layout
 
 ```

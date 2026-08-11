@@ -29,14 +29,19 @@ const idleConnTimeout = 20 * time.Second
 // concurrency of 1, still keep a reasonable pool.
 const minPoolSize = 100
 
-// poolSize derives the connection pool size from the benchmark's concurrency.
+// PoolSize derives a connection pool size from the benchmark's concurrency.
+// Exported so every transport that pools connections — including the Bolt
+// driver's own connection pool in benchmarks/bolt.go — sizes itself the same
+// way; a pool sized only for one transport would plateau at a different
+// concurrency than the others, turning a client-side artifact into what
+// looks like a protocol difference.
 //
-// Go's default MaxIdleConnsPerHost is 2, and the previous hardcoded 100 was
-// fine at 4 workers but became a silent ceiling above that: surplus connections
-// were closed rather than pooled, so every request past the limit paid a fresh
-// TCP (and TLS) handshake. The resulting throughput plateau looks exactly like
-// server saturation.
-func poolSize(concurrency int) int {
+// Go's default MaxIdleConnsPerHost is 2, and a hardcoded 100 was fine at 4
+// workers but became a silent ceiling above that: surplus connections were
+// closed rather than pooled, so every request past the limit paid a fresh
+// TCP (and TLS) handshake. The resulting throughput plateau looks exactly
+// like server saturation.
+func PoolSize(concurrency int) int {
 	n := concurrency * 2
 	if n < minPoolSize {
 		return minPoolSize
@@ -74,7 +79,7 @@ func NewFresh(timeout time.Duration) *http.Client {
 // concurrency is the number of goroutines that will share this client; the
 // connection pool is sized from it.
 func NewSession(timeout time.Duration, concurrency int) *http.Client {
-	n := poolSize(concurrency)
+	n := PoolSize(concurrency)
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
@@ -98,7 +103,7 @@ func NewSession(timeout time.Duration, concurrency int) *http.Client {
 // server's SETTINGS_MAX_CONCURRENT_STREAMS rather than by the pool. Neo4j
 // behind HAProxy in HTTP/2 mode typically advertises 100.
 func NewSessionHTTP2(timeout time.Duration, concurrency int) (*http.Client, error) {
-	n := poolSize(concurrency)
+	n := PoolSize(concurrency)
 	t := &http.Transport{
 		MaxIdleConns:        n,
 		MaxIdleConnsPerHost: n,

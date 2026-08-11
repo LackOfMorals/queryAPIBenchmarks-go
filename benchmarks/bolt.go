@@ -5,8 +5,10 @@ import (
 
 	query "github.com/neo4j-contrib/query-go-sdk"
 	"github.com/neo4j/neo4j-go-driver/v6/neo4j"
+	"github.com/neo4j/neo4j-go-driver/v6/neo4j/config"
 
 	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/runner"
+	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/transport"
 )
 
 // boltClient runs every iteration as an auto-commit call via
@@ -35,8 +37,8 @@ type boltClient struct {
 
 var _ Client = (*boltClient)(nil)
 
-func newBoltClient(cfg Config) (Client, error) {
-	driver, err := neo4j.NewDriver(cfg.URL, neo4j.BasicAuth(cfg.Username, cfg.Password, ""))
+func newBoltClient(cfg Config, concurrency int) (Client, error) {
+	driver, err := neo4j.NewDriver(cfg.URL, neo4j.BasicAuth(cfg.Username, cfg.Password, ""), boltDriverConfig(concurrency))
 	if err != nil {
 		return nil, err
 	}
@@ -62,4 +64,35 @@ func (c *boltClient) Tx(cypher string) runner.TxFunc {
 
 func (c *boltClient) Close(ctx context.Context) error {
 	return c.driver.Close(ctx)
+}
+
+// boltDriverConfig aligns two driver defaults with how the HTTP paths behave,
+// so a close legacy/queryv2/bolt comparison isn't skewed by client-side
+// configuration differences that have nothing to do with the wire protocol.
+// Factored out (rather than an inline closure in newBoltClient) so both
+// settings are independently unit-testable without constructing a Driver.
+func boltDriverConfig(concurrency int) func(*config.Config) {
+	return func(c *config.Config) {
+		// Match the HTTP paths' pool sizing (transport.PoolSize) instead of
+		// the driver default of a flat 100: without this, a saturation
+		// sweep above ~50 concurrent workers hits Bolt's pool limit and
+		// queues (up to ConnectionAcquisitionTimeout, 1 minute by default)
+		// at a different concurrency than HTTP's pool does, making a
+		// client-side pool-sizing mismatch look like a protocol-level
+		// throughput difference.
+		c.MaxConnectionPoolSize = transport.PoolSize(concurrency)
+
+		// ExecuteQuery retries retryable failures (leader switch, deadlock,
+		// transient unavailability) by default for up to 30s (config
+		// default). query-go-sdk retries only bare network errors up to 3x,
+		// and internal/managed never retries a Cypher failure — so leaving
+		// Bolt's default in place would silently fold retry time into a
+		// "successful" call's latency and lower its measured failure count,
+		// biasing exactly the kind of close 3-way comparison this tool
+		// exists to make. Disabling it (any non-negative value works; the
+		// retry loop only checks elapsed time after a failure, and a real
+		// round trip always elapses > 0) keeps Bolt's failure/latency
+		// accounting on the same footing as the other two backends.
+		c.MaxTransactionRetryTime = 0
+	}
 }

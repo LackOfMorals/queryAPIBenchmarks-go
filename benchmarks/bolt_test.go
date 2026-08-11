@@ -6,6 +6,9 @@ import (
 
 	query "github.com/neo4j-contrib/query-go-sdk"
 	"github.com/neo4j/neo4j-go-driver/v6/neo4j"
+	"github.com/neo4j/neo4j-go-driver/v6/neo4j/config"
+
+	"github.com/LackOfMorals/queryAPIBenchmarks-go/internal/transport"
 )
 
 func TestNewBoltClient(t *testing.T) {
@@ -28,7 +31,7 @@ func TestNewBoltClient(t *testing.T) {
 				AccessMode: tt.accessMode,
 			}
 
-			client, err := newBoltClient(cfg)
+			client, err := newBoltClient(cfg, 4)
 			if err != nil {
 				t.Fatalf("newBoltClient() error = %v", err)
 			}
@@ -53,7 +56,38 @@ func TestNewBoltClient(t *testing.T) {
 
 func TestNewBoltClient_RejectsNonBoltScheme(t *testing.T) {
 	cfg := Config{URL: "http://localhost:7474", Username: "neo4j", Password: "password", Database: "neo4j"}
-	if _, err := newBoltClient(cfg); err == nil {
+	if _, err := newBoltClient(cfg, 4); err == nil {
 		t.Error("newBoltClient() with an http:// URL: expected an error, got nil")
+	}
+}
+
+// TestBoltDriverConfig checks the two settings that keep a legacy/queryv2/bolt
+// comparison from being skewed by client-side configuration rather than
+// protocol differences: the connection pool scales with concurrency the same
+// way transport.PoolSize does for the HTTP paths, and automatic transaction
+// retries (which would silently fold retry time into "successful" latency)
+// are disabled. Tested directly against config.Config rather than through
+// newBoltClient/neo4j.NewDriver, since neo4j.Driver's public interface
+// exposes no getter for either setting.
+func TestBoltDriverConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		concurrency int
+	}{
+		{name: "low concurrency floors at PoolSize's minimum", concurrency: 1},
+		{name: "high concurrency scales the pool", concurrency: 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var c config.Config
+			boltDriverConfig(tt.concurrency)(&c)
+
+			if want := transport.PoolSize(tt.concurrency); c.MaxConnectionPoolSize != want {
+				t.Errorf("MaxConnectionPoolSize = %d, want %d (transport.PoolSize(%d))", c.MaxConnectionPoolSize, want, tt.concurrency)
+			}
+			if c.MaxTransactionRetryTime != 0 {
+				t.Errorf("MaxTransactionRetryTime = %v, want 0 (retries disabled)", c.MaxTransactionRetryTime)
+			}
+		})
 	}
 }

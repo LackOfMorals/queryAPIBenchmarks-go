@@ -24,7 +24,17 @@
 //     execute/commit/rollback; execute/commit/rollback keep going through
 //     whatever endpoint begin used (typically the load balancer), and the
 //     cluster itself routes using that header rather than the client
-//     targeting a node's address directly.
+//     targeting a node's address directly. Read/write access-mode routing
+//     (-mode) is likewise a body field ("accessMode") for this flavor, not a
+//     header — see accessModeValue.
+//
+// The query-go-sdk-backed implicit-transaction benchmarks (see
+// benchmarks/benchmarks.go) have no equivalent fix: that dependency sends
+// Query API v2's access mode as a header too, which the server does not
+// read for that purpose, so implicit/queryv2 read benchmarks against a
+// cluster may still all land on the leader regardless of -mode. Prefer
+// -transaction managed for a read-routing-sensitive comparison until that's
+// fixed upstream.
 package managed
 
 import (
@@ -89,14 +99,25 @@ func NewClient(httpClient *http.Client, baseURL, database, username, password st
 	}
 }
 
-// v2 execute body: {"statement": "..."}
+// v2 execute body: {"statement": "...", "accessMode": "Read"}. AccessMode is
+// Query API v2 only (see setHeaders) — the legacy branch never sets it, so
+// omitempty drops it from legacy's identically-shaped per-statement bodies.
 type statementBody struct {
-	Statement string `json:"statement"`
+	Statement  string `json:"statement"`
+	AccessMode string `json:"accessMode,omitempty"`
 }
 
 // legacy execute body: {"statements": [{"statement": "..."}]}
 type legacyStatements struct {
 	Statements []statementBody `json:"statements"`
+}
+
+// v2 begin body: {"accessMode": "Read"}. Access mode is a whole-transaction
+// property, so it belongs on begin; it's also repeated on every execute call
+// (see statementBody) since the docs don't say begin-only is sufficient and
+// repeating it costs nothing.
+type beginQueryV2Body struct {
+	AccessMode string `json:"accessMode,omitempty"`
 }
 
 // legacyEnvelope is the minimal shape needed to spot Cypher errors in a Legacy
@@ -126,7 +147,18 @@ func (c *Client) RunTransaction(ctx context.Context, cypher string) error {
 // begin opens a transaction. See the package comment for how the returned
 // transaction is built and routed for each flavor.
 func (c *Client) begin(ctx context.Context) (transaction, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.txURL, http.NoBody)
+	// Legacy has no begin-time body: its access-mode hint is the Access-Mode
+	// header (setHeaders), sent on every call including this one.
+	var body io.Reader = http.NoBody
+	if !c.legacy {
+		b, err := json.Marshal(beginQueryV2Body{AccessMode: c.accessModeValue()})
+		if err != nil {
+			return transaction{}, fmt.Errorf("begin: marshal body: %w", err)
+		}
+		body = bytes.NewReader(b)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.txURL, body)
 	if err != nil {
 		return transaction{}, err
 	}
@@ -208,7 +240,7 @@ func (c *Client) execute(ctx context.Context, tx transaction, cypher string) err
 	if c.legacy {
 		payload = legacyStatements{Statements: []statementBody{{Statement: cypher}}}
 	} else {
-		payload = statementBody{Statement: cypher}
+		payload = statementBody{Statement: cypher, AccessMode: c.accessModeValue()}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -270,6 +302,12 @@ func (c *Client) rollback(ctx context.Context, tx transaction) error {
 // setHeaders sets the headers common to every call in a transaction cycle.
 // affinity is the cluster-affinity token to replay (Query API v2 only); pass
 // "" for begin, where there is nothing to replay yet.
+//
+// Access-mode routing is NOT set here for Query API v2: per
+// https://neo4j.com/docs/query-api/current/routing/, it's a JSON body field
+// ("accessMode": "Read"/"Write" — see beginQueryV2Body/statementBody and
+// accessModeValue), not a header. A header of that name is documented for
+// the Legacy Cypher HTTP Transaction API only.
 func (c *Client) setHeaders(req *http.Request, affinity string) {
 	req.Header.Set("Authorization", c.authHeader)
 	req.Header.Set("Content-Type", "application/json")
@@ -282,16 +320,16 @@ func (c *Client) setHeaders(req *http.Request, affinity string) {
 		} else {
 			req.Header.Set("Access-Mode", "WRITE")
 		}
-	} else {
-		// NOTE: verify this is honoured. Query API v2 may expect accessMode as a
-		// field in the request body rather than a header. If the hint is ignored,
-		// every read routes to the leader and the other two nodes sit idle.
-		if c.readAccessMode {
-			req.Header.Set("accessMode", "read")
-		} else {
-			req.Header.Set("accessMode", "write")
-		}
 	}
+}
+
+// accessModeValue is the Query API v2 body-field spelling of readAccessMode:
+// "Read" or "Write", capitalized per the documented examples.
+func (c *Client) accessModeValue() string {
+	if c.readAccessMode {
+		return "Read"
+	}
+	return "Write"
 }
 
 // isSuccess reports whether code is a 2xx.
