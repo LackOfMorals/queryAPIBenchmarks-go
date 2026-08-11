@@ -9,3 +9,4 @@ legacy.txt
 
 /results
 .DS_Store
+bench-linux-amd64
