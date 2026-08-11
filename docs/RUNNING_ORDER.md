@@ -25,14 +25,17 @@ diagnose it from benchmark output.
 
 ## 2. Warm the caches (discarded)
 
-`make bench-warmup` primes Neo4j's query plan cache and page cache. Do this
+```bash
+./bench -transaction implicit    -cypher "MATCH (c:Company {companyNumber: '02026964'}) RETURN c.name"           -n 50 -warmup 0 -workers 4
+./bench -transaction implicit    -cypher "MATCH (c:Company)-[:HAS_SIC_CODE]->(s:SICCode) RETURN s.code, count(c) AS n ORDER BY n DESC LIMIT 20"          -n 20 -warmup 0 -workers 4
+```
+
+primes Neo4j's query plan cache and page cache. Do this
 once per backend switch, not once per query — the plan cache is shared
 across all Cypher text, and cold-cache latency on the *first* query of a
 block will otherwise leak into that query's numbers.
 
-```bash
-make bench-warmup
-```
+
 
 ## 3. Run each backend as its own block, not interleaved
 
@@ -109,9 +112,9 @@ confidence intervals rather than point estimates.
 set -a && source .env && set +a
 make bench-warmup
 
-./bench -api queryv2 -transaction managed  -queries-file queries.toml -concurrency all -connection all -n 100 -runs 10 -format benchstat > queryv2-managed.txt
-./bench -api queryv2 -transaction implicit -queries-file queries.toml -concurrency all -connection all -n 100 -runs 10 -format benchstat > queryv2-implicit.txt
-./bench -api legacy  -queries-file queries.toml -concurrency all -connection all -n 100 -runs 10 -format benchstat > legacy.txt
-./bench -api bolt -bolt-scheme neo4j -queries-file queries.toml -concurrency all -n 100 -runs 10 -format benchstat > bolt-neo4j.txt
-./bench -api bolt -bolt-scheme bolt  -queries-file queries.toml -concurrency all -n 100 -runs 10 -format benchstat > bolt-bolt.txt
+./bench -api queryv2 -transaction managed  -queries-file queries.toml -concurrency all -connection all -n 100 -runs 10 -format benchstat > ./results/queryv2-managed.txt
+./bench -api queryv2 -transaction implicit -queries-file queries.toml -concurrency all -connection all -n 100 -runs 10 -format benchstat > ./results/queryv2-implicit.txt
+./bench -api legacy  -queries-file queries.toml -concurrency all -connection all -n 100 -runs 10 -format benchstat > ./results/legacy.txt
+./bench -api bolt -bolt-scheme neo4j -queries-file queries.toml -concurrency all -n 100 -runs 10 -format benchstat > ./results/bolt-neo4j.txt
+./bench -api bolt -bolt-scheme bolt  -queries-file queries.toml -concurrency all -n 100 -runs 10 -format benchstat > ./results/bolt-bolt.txt
 ```

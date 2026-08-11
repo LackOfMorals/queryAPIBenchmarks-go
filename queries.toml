@@ -24,7 +24,7 @@ cypher = "MATCH (c:Company {companyNumber: '13244615'})<-[r:PSC_OF]-(psc) RETURN
 
 [[queries]]
 label  = "aggregation"
-cypher = "MATCH (c:Company)-[:HAS_SIC_CODE]->(s:SICCode) RETURN s.code, count(c) AS companyCount ORDER BY companyCount DESC LIMIT 20"
+cypher = "MATCH (s:SICCode) RETURN s.code, s.companyCount AS companyCount ORDER BY companyCount DESC LIMIT 20"
 
 [[queries]]
 label  = "fulltext-search"
@@ -36,8 +36,8 @@ cypher = "MATCH (a:Address {postCode: 'WC2H 9JQ'})<-[:REGISTERED_AT]-(c:Company)
 
 [[queries]]
 label  = "count-scalar"
-cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN count(c)"
+cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN count(c) LIMIT 100"
 
 [[queries]]
 label  = "bulk-rows"
-cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN c.companyNumber, c.name, c.postCode SKIP 0 LIMIT 1000"
+cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN c.companyNumber, c.name, c.postCode SKIP 0 LIMIT 100"
