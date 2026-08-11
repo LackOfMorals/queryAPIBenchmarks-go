@@ -35,8 +35,12 @@ tidy:
 #   3. bench-filtered-scan
 #   4. bench-one-hop
 #   5. bench-two-hop
-#   6. bench-aggregation
-#   7. bench-bulk-rows
+#   6. bench-psc-lookup
+#   7. bench-aggregation
+#   8. bench-fulltext-search
+#   9. bench-supernode-fanout
+#  10. bench-count-scalar
+#  11. bench-bulk-rows
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -105,7 +109,24 @@ bench-two-hop: build
 	  -n $(N) -warmup $(WARMUP) -workers $(WORKERS)
 
 # ---------------------------------------------------------------------------
-# 5. AGGREGATION
+# 5. PSC LOOKUP
+#    Beneficial-ownership relationship properties for a company with several
+#    PSCs (GRAVITY TOPCO LIMITED, 8 PSCs) — mixes Person and LegalEntity PSC
+#    nodes, returns relationship properties (natures, ownership range).
+#    Tests: inbound relationship traversal on a low-cardinality edge type
+#    (PSC_OF: 3.3k total) plus property projection off the relationship
+#    itself rather than just the node.
+#    Expected result set: 8 rows.
+# ---------------------------------------------------------------------------
+bench-psc-lookup: build
+	./bench $(ALL_IMPLICIT) \
+	  -host $(NEO4J_HOST) -usr $(NEO4J_USERNAME) -pwd $(NEO4J_PASSWORD) \
+	  -db $(NEO4J_DATABASE) \
+	  -cypher "MATCH (c:Company {companyNumber: '13244615'})<-[r:PSC_OF]-(psc) RETURN coalesce(psc.chName, psc.name) AS pscName, r.natures, r.ownershipMin, r.ownershipMax" \
+	  -n $(N) -warmup $(WARMUP) -workers $(WORKERS)
+
+# ---------------------------------------------------------------------------
+# 6. AGGREGATION
 #    Group companies by SIC code, count, sort, return top 20.
 #    Tests: aggregation pipeline throughput + numeric serialisation.
 #    HAS_SIC_CODE has 7.5M relationships — this is a real aggregation workload.
@@ -119,7 +140,53 @@ bench-aggregation: build
 	  -n $(N) -warmup $(WARMUP) -workers $(WORKERS)
 
 # ---------------------------------------------------------------------------
-# 6. BULK ROW RETURN
+# 7. FULLTEXT SEARCH
+#    Company name search via the company_name_search fulltext index.
+#    Tests: fulltext (Lucene) index path rather than the b-tree range
+#    indexes every other query hits — a distinct execution engine inside
+#    Neo4j, and a realistic "search by name" query shape.
+#    Expected result set: up to 20 rows with a relevance score.
+# ---------------------------------------------------------------------------
+bench-fulltext-search: build
+	./bench $(ALL_IMPLICIT) \
+	  -host $(NEO4J_HOST) -usr $(NEO4J_USERNAME) -pwd $(NEO4J_PASSWORD) \
+	  -db $(NEO4J_DATABASE) \
+	  -cypher "CALL db.index.fulltext.queryNodes('company_name_search', 'TESCO') YIELD node, score RETURN node.name, node.companyNumber, score LIMIT 20" \
+	  -n $(N) -warmup $(WARMUP) -workers $(WORKERS)
+
+# ---------------------------------------------------------------------------
+# 8. SUPERNODE FANOUT
+#    Traversal from a real mass-registered-agent address (71-75 Shelton
+#    Street, WC2H 9JQ — 66,732 companies REGISTERED_AT it) bounded by LIMIT.
+#    Tests: relationship traversal off a genuine high-degree hub, the kind
+#    of node a naive unbounded expansion would choke on.
+#    Expected result set: 100 rows.
+# ---------------------------------------------------------------------------
+bench-supernode-fanout: build
+	./bench $(ALL_IMPLICIT) \
+	  -host $(NEO4J_HOST) -usr $(NEO4J_USERNAME) -pwd $(NEO4J_PASSWORD) \
+	  -db $(NEO4J_DATABASE) \
+	  -cypher "MATCH (a:Address {postCode: 'WC2H 9JQ'})<-[:REGISTERED_AT]-(c:Company) RETURN c.companyNumber, c.name LIMIT 100" \
+	  -n $(N) -warmup $(WARMUP) -workers $(WORKERS)
+
+# ---------------------------------------------------------------------------
+# 9. COUNT SCALAR
+#    Same predicate as bench-bulk-rows (status = 'Active', 5.16M matches)
+#    but a single aggregate row instead of 1000 hydrated rows.
+#    Tests: isolates request/response and compute overhead from
+#    serialisation-at-volume — pair with bench-bulk-rows to see how much of
+#    that test's cost is payload size vs. everything else.
+#    Expected result set: 1 row, 1 scalar.
+# ---------------------------------------------------------------------------
+bench-count-scalar: build
+	./bench $(ALL_IMPLICIT) \
+	  -host $(NEO4J_HOST) -usr $(NEO4J_USERNAME) -pwd $(NEO4J_PASSWORD) \
+	  -db $(NEO4J_DATABASE) \
+	  -cypher "MATCH (c:Company) WHERE c.status = 'Active' RETURN count(c)" \
+	  -n $(N) -warmup $(WARMUP) -workers $(WORKERS)
+
+# ---------------------------------------------------------------------------
+# 10. BULK ROW RETURN
 #    Paginated scan returning 1000 rows per request.
 #    Tests: serialisation cost at volume — the axis most sensitive to the
 #    Bolt-vs-HTTP transport change.
@@ -160,7 +227,11 @@ bench-all: bench-warmup \
            bench-filtered-scan \
            bench-one-hop \
            bench-two-hop \
+           bench-psc-lookup \
            bench-aggregation \
+           bench-fulltext-search \
+           bench-supernode-fanout \
+           bench-count-scalar \
            bench-bulk-rows
 
 

@@ -16,18 +16,28 @@ cypher = "MATCH (:Company {companyNumber: 'SC521741'})<-[:OFFICER_OF]-(p:Person)
 
 [[queries]]
 label  = "two-hop"
-cypher = "MATCH (:Company {companyNumber: 'SC521741'})<-[:OFFICER_OF]-(p:Person) WITH p MATCH (p)-[:OFFICER_OF]->(other:Company) RETURN DISTINCT other.name, other.companyNumber, p.chName LIMIT 50"
+cypher = "MATCH (:Company {companyNumber: 'SC521741'})<-[:OFFICER_OF]-(p:Person)-[:OFFICER_OF]->(other:Company) RETURN DISTINCT other.name, other.companyNumber, p.chName LIMIT 50"
 
-#[[queries]]
-#label  = "aggregation"
-#cypher = "MATCH (c:Company)-[:HAS_SIC_CODE]->(s:SICCode) RETURN s.code, count(c) AS companyCount ORDER BY companyCount DESC LIMIT 20"
-#cypher = "MATCH (s:SICCode)<-[:HAS_SIC_CODE]-(c:Company) WITH s, count(c) AS n ORDER BY n DESC LIMIT 20 RETURN s.code, n"
+[[queries]]
+label  = "psc-lookup"
+cypher = "MATCH (c:Company {companyNumber: '13244615'})<-[r:PSC_OF]-(psc) RETURN coalesce(psc.chName, psc.name) AS pscName, r.natures, r.ownershipMin, r.ownershipMax"
+
+[[queries]]
+label  = "aggregation"
+cypher = "MATCH (c:Company)-[:HAS_SIC_CODE]->(s:SICCode) RETURN s.code, count(c) AS companyCount ORDER BY companyCount DESC LIMIT 20"
+
+[[queries]]
+label  = "fulltext-search"
+cypher = "CALL db.index.fulltext.queryNodes('company_name_search', 'TESCO') YIELD node, score RETURN node.name, node.companyNumber, score LIMIT 20"
+
+[[queries]]
+label  = "supernode-fanout"
+cypher = "MATCH (a:Address {postCode: 'WC2H 9JQ'})<-[:REGISTERED_AT]-(c:Company) RETURN c.companyNumber, c.name LIMIT 100"
+
+[[queries]]
+label  = "count-scalar"
+cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN count(c)"
 
 [[queries]]
 label  = "bulk-rows"
 cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN c.companyNumber, c.name, c.postCode SKIP 0 LIMIT 1000"
-
-
-
-
-
