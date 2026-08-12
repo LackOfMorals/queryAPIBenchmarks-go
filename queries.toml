@@ -40,4 +40,22 @@ cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN count(c) LIMIT 100"
 
 [[queries]]
 label  = "bulk-rows"
-cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN c.companyNumber, c.name, c.postCode SKIP 0 LIMIT 100"
+cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN c.companyNumber, c.name, c.postCode SKIP 0 LIMIT 1000"
+
+# Size ladder for the streaming (-streaming) axis: does the buffered-vs-
+# streaming gap grow with result size, or stay flat? Both share the same
+# 10MB query-go-sdk response cap (enforced identically for Execute and
+# ExecuteStream), so even 20k rows of this narrow shape stays well under it.
+[[queries]]
+label  = "bulk-rows-5k"
+cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN c.companyNumber, c.name, c.postCode SKIP 0 LIMIT 5000"
+
+[[queries]]
+label  = "bulk-rows-20k"
+cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN c.companyNumber, c.name, c.postCode SKIP 0 LIMIT 20000"
+
+# Same row count as bulk-rows, more columns per row — isolates row *width*
+# from row *count* for the streaming comparison.
+[[queries]]
+label  = "bulk-rows-wide"
+cypher = "MATCH (c:Company) WHERE c.status = 'Active' RETURN c.companyNumber, c.name, c.status, c.incorporationDate, c.postCode, c.postCodePrefix SKIP 0 LIMIT 1000"
