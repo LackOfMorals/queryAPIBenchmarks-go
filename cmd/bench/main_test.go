@@ -34,10 +34,11 @@ func TestTestCases(t *testing.T) {
 	txs := []benchmarks.Transaction{benchmarks.TransactionImplicit, benchmarks.TransactionManaged}
 	concs := []benchmarks.Concurrency{benchmarks.ConcurrencySequential, benchmarks.ConcurrencyConcurrent}
 	conns := []benchmarks.Connection{benchmarks.ConnectionFresh, benchmarks.ConnectionPooled}
+	streams := []benchmarks.Streaming{benchmarks.StreamingOff, benchmarks.StreamingOn}
 
-	got := testCases(txs, concs, conns)
+	got := testCases(txs, concs, conns, streams)
 
-	if want := len(txs) * len(concs) * len(conns); len(got) != want {
+	if want := len(txs) * len(concs) * len(conns) * len(streams); len(got) != want {
 		t.Fatalf("testCases returned %d cases, want %d (cartesian product)", len(got), want)
 	}
 
@@ -48,8 +49,11 @@ func TestTestCases(t *testing.T) {
 		}
 		seen[c] = true
 	}
-	if !seen[testCase{tx: benchmarks.TransactionManaged, conc: benchmarks.ConcurrencyConcurrent, conn: benchmarks.ConnectionPooled}] {
-		t.Errorf("expected the managed/concurrent/pooled combination to be present")
+	if !seen[testCase{tx: benchmarks.TransactionManaged, conc: benchmarks.ConcurrencyConcurrent, conn: benchmarks.ConnectionPooled, stream: benchmarks.StreamingOff}] {
+		t.Errorf("expected the managed/concurrent/pooled/buffered combination to be present")
+	}
+	if !seen[testCase{tx: benchmarks.TransactionImplicit, conc: benchmarks.ConcurrencySequential, conn: benchmarks.ConnectionFresh, stream: benchmarks.StreamingOn}] {
+		t.Errorf("expected the implicit/sequential/fresh/streaming combination to be present")
 	}
 }
 
@@ -178,6 +182,81 @@ func TestResolveConnections(t *testing.T) {
 			}
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("resolveConnections(%v, %v) = %v, want %v", tt.raw, tt.kind, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveStreaming(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     []string
+		kind    benchmarks.Kind
+		want    []benchmarks.Streaming
+		wantErr bool
+	}{
+		{name: "empty defaults to buffered", raw: nil, kind: benchmarks.KindQueryV2, want: []benchmarks.Streaming{benchmarks.StreamingOff}},
+		{name: "streaming is fine for queryv2", raw: []string{"streaming"}, kind: benchmarks.KindQueryV2, want: []benchmarks.Streaming{benchmarks.StreamingOn}},
+		{name: "all expands to both for queryv2", raw: []string{"all"}, kind: benchmarks.KindQueryV2, want: []benchmarks.Streaming{benchmarks.StreamingOff, benchmarks.StreamingOn}},
+		{name: "streaming rejected for legacy", raw: []string{"streaming"}, kind: benchmarks.KindLegacy, wantErr: true},
+		{name: "streaming rejected for bolt", raw: []string{"streaming"}, kind: benchmarks.KindBolt, wantErr: true},
+		{name: "all rejected for legacy (includes streaming)", raw: []string{"all"}, kind: benchmarks.KindLegacy, wantErr: true},
+		{name: "buffered is fine for legacy", raw: []string{"buffered"}, kind: benchmarks.KindLegacy, want: []benchmarks.Streaming{benchmarks.StreamingOff}},
+		{name: "unknown value", raw: []string{"bogus"}, kind: benchmarks.KindQueryV2, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveStreaming(tt.raw, tt.kind)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveStreaming(%v, %v) error = %v, wantErr %v", tt.raw, tt.kind, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("resolveStreaming(%v, %v) = %v, want %v", tt.raw, tt.kind, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateStreamingTransaction(t *testing.T) {
+	tests := []struct {
+		name    string
+		txs     []benchmarks.Transaction
+		streams []benchmarks.Streaming
+		wantErr bool
+	}{
+		{
+			name:    "implicit + streaming is fine",
+			txs:     []benchmarks.Transaction{benchmarks.TransactionImplicit},
+			streams: []benchmarks.Streaming{benchmarks.StreamingOn},
+		},
+		{
+			name:    "managed + buffered is fine",
+			txs:     []benchmarks.Transaction{benchmarks.TransactionManaged},
+			streams: []benchmarks.Streaming{benchmarks.StreamingOff},
+		},
+		{
+			name:    "managed + streaming is rejected",
+			txs:     []benchmarks.Transaction{benchmarks.TransactionManaged},
+			streams: []benchmarks.Streaming{benchmarks.StreamingOn},
+			wantErr: true,
+		},
+		{
+			name:    "transaction all + streaming all is rejected (covers managed+streaming)",
+			txs:     []benchmarks.Transaction{benchmarks.TransactionImplicit, benchmarks.TransactionManaged},
+			streams: []benchmarks.Streaming{benchmarks.StreamingOff, benchmarks.StreamingOn},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateStreamingTransaction(tt.txs, tt.streams)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateStreamingTransaction(%v, %v) error = %v, wantErr %v", tt.txs, tt.streams, err, tt.wantErr)
 			}
 		})
 	}

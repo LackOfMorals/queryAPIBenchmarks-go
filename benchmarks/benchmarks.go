@@ -66,6 +66,20 @@ const (
 	ConnectionPooled Connection = "pooled"
 )
 
+// Streaming selects whether an implicit Query API v2 call buffers the whole
+// response before returning (query-go-sdk's Execute) or decodes it
+// incrementally as it arrives (ExecuteStream, added in query-go-sdk v0.5.0).
+// Meaningless for KindLegacy (the legacy Cypher HTTP Transaction API has no
+// streaming format) and KindBolt (Bolt already streams at the protocol
+// level regardless of client choice), and for TransactionManaged
+// (query-go-sdk's ExecuteStream only covers the auto-commit implicit path).
+type Streaming string
+
+const (
+	StreamingOff Streaming = "buffered"
+	StreamingOn  Streaming = "streaming"
+)
+
 // Config holds everything needed to construct a client and run a benchmark.
 type Config struct {
 	URL      string
@@ -109,8 +123,8 @@ type Client interface {
 
 // Run executes cypher against the backend and execution shape selected by
 // cfg.Kind, tx, conc and conn, and returns the measured result.
-func Run(ctx context.Context, cfg Config, cypher string, tx Transaction, conc Concurrency, conn Connection) (runner.Result, error) {
-	client, err := newClient(cfg, tx, conn, effectiveConcurrency(cfg, conc))
+func Run(ctx context.Context, cfg Config, cypher string, tx Transaction, conc Concurrency, conn Connection, streaming Streaming) (runner.Result, error) {
+	client, err := newClient(cfg, tx, conn, streaming, effectiveConcurrency(cfg, conc))
 	if err != nil {
 		return runner.Result{}, err
 	}
@@ -120,7 +134,7 @@ func Run(ctx context.Context, cfg Config, cypher string, tx Transaction, conc Co
 	defer func() { _ = client.Close(ctx) }()
 
 	runnerCfg := cfg.Config
-	runnerCfg.Name = DisplayName(cfg.Kind, tx, conc, conn)
+	runnerCfg.Name = DisplayName(cfg.Kind, tx, conc, conn, streaming)
 
 	fn := client.Tx(cypher)
 	if conc == ConcurrencyConcurrent {
@@ -132,27 +146,34 @@ func Run(ctx context.Context, cfg Config, cypher string, tx Transaction, conc Co
 // DisplayName renders the composite, self-describing test name shown in
 // output tables/JSON/benchstat, e.g. "implicit/sequential/fresh". Bolt has
 // no connection axis, so its name omits that segment, e.g.
-// "implicit/concurrent".
-func DisplayName(kind Kind, tx Transaction, conc Concurrency, conn Connection) string {
+// "implicit/concurrent". The streaming segment is shown only for the one
+// combination it's meaningful for — KindQueryV2 + TransactionImplicit —
+// since it's forced to StreamingOff everywhere else (see resolveStreaming);
+// showing a segment that never varies would just be noise.
+func DisplayName(kind Kind, tx Transaction, conc Concurrency, conn Connection, streaming Streaming) string {
 	name := string(tx) + "/" + string(conc)
 	if kind == KindBolt {
 		return name
 	}
-	return name + "/" + string(conn)
+	name += "/" + string(conn)
+	if kind == KindQueryV2 && tx == TransactionImplicit {
+		name += "/" + string(streaming)
+	}
+	return name
 }
 
 // newClient picks the concrete Client implementation for cfg.Kind, baking in
-// the transaction and connection style once instead of selecting per call —
-// building both an implicit and a managed client eagerly would waste half
-// the work, since a given run only ever needs one combination.
-func newClient(cfg Config, tx Transaction, conn Connection, concurrency int) (Client, error) {
+// the transaction, connection, and streaming style once instead of selecting
+// per call — building every combination eagerly would waste most of the
+// work, since a given run only ever needs one.
+func newClient(cfg Config, tx Transaction, conn Connection, streaming Streaming, concurrency int) (Client, error) {
 	if cfg.Kind == KindBolt {
 		return newBoltClient(cfg, concurrency)
 	}
 	if tx == TransactionManaged {
 		return newManagedHTTPClient(cfg, conn, concurrency)
 	}
-	return newImplicitHTTPClient(cfg, conn, concurrency)
+	return newImplicitHTTPClient(cfg, conn, streaming, concurrency)
 }
 
 // effectiveConcurrency reports how many goroutines a concurrent benchmark
@@ -190,24 +211,29 @@ type httpImplicitClient struct {
 	// pool's idle sockets stay open for idleConnTimeout after the benchmark
 	// ends and fd usage climbs across a multi-test invocation.
 	httpClient *http.Client
+
+	// streaming selects ExecuteStream (incremental JSON Lines decode) over
+	// Execute (buffer the whole response) in Tx. Baked in at construction —
+	// see newClient — since a given run only ever needs one.
+	streaming bool
 }
 
 var _ Client = (*httpImplicitClient)(nil)
 
-func newImplicitHTTPClient(cfg Config, conn Connection, concurrency int) (Client, error) {
+func newImplicitHTTPClient(cfg Config, conn Connection, streaming Streaming, concurrency int) (Client, error) {
 	if conn == ConnectionFresh {
-		client, err := newFreshClient(cfg)
+		client, err := newFreshClient(cfg, streaming)
 		if err != nil {
 			return nil, err
 		}
-		return &httpImplicitClient{client: client}, nil
+		return &httpImplicitClient{client: client, streaming: streaming == StreamingOn}, nil
 	}
 
-	client, httpClient, err := newSessionClient(cfg, concurrency)
+	client, httpClient, err := newSessionClient(cfg, streaming, concurrency)
 	if err != nil {
 		return nil, err
 	}
-	return &httpImplicitClient{client: client, httpClient: httpClient}, nil
+	return &httpImplicitClient{client: client, httpClient: httpClient, streaming: streaming == StreamingOn}, nil
 }
 
 // CAVEAT (KindLegacy): the Legacy Cypher HTTP Transaction API reports Cypher
@@ -217,9 +243,37 @@ func newImplicitHTTPClient(cfg Config, conn Connection, concurrency int) (Client
 // before trusting a legacy implicit run: point one at deliberately invalid
 // Cypher and confirm the failure count is non-zero rather than a clean 0 / N.
 func (c *httpImplicitClient) Tx(cypher string) runner.TxFunc {
+	if c.streaming {
+		return c.txStream(cypher)
+	}
 	return func(ctx context.Context) error {
 		_, err := query.WithTransformer(c.client.Query, ctx, cypher, nil, query.EagerResultTransformer)
 		return err
+	}
+}
+
+// txStream drains ExecuteStream's incremental JSON Lines decode into a
+// slice, matching Execute/EagerResultTransformer's fully-materialized shape.
+// This is the fairness requirement, not an incidental choice: discarding
+// records as they arrive instead of collecting them would measure "does
+// less work," not "decodes the wire format differently" — the two
+// implementations must do the same amount of work downstream of the wire
+// for a streaming-vs-buffered comparison to mean what it claims to.
+func (c *httpImplicitClient) txStream(cypher string) runner.TxFunc {
+	return func(ctx context.Context) error {
+		result, err := c.client.Query.ExecuteStream(ctx, cypher, nil)
+		if err != nil {
+			return err
+		}
+		records := make([]*query.Record, 0, 128)
+		for rec, err := range result.Records() {
+			if err != nil {
+				return err
+			}
+			records = append(records, rec)
+		}
+		_ = records // kept alive deliberately -- see the fairness note above
+		return nil
 	}
 }
 
@@ -231,7 +285,7 @@ func (c *httpImplicitClient) Close(context.Context) error {
 	return nil
 }
 
-func newFreshClient(cfg Config) (*query.QueryAPIClient, error) {
+func newFreshClient(cfg Config, streaming Streaming) (*query.QueryAPIClient, error) {
 	httpClient := transport.NewFresh(cfg.Timeout)
 	return query.NewClient(
 		query.WithBasicAuth(cfg.Username, cfg.Password),
@@ -242,13 +296,14 @@ func newFreshClient(cfg Config) (*query.QueryAPIClient, error) {
 		query.WithLogger(cfg.Logger),
 		query.WithAPIFlavor(cfg.flavor()),
 		query.WithAccessMode(cfg.AccessMode),
+		query.WithStreamingSupport(streaming == StreamingOn),
 	)
 }
 
 // newSessionClient builds a keep-alive client. concurrency is the number of
 // goroutines that will share it, and sizes the connection pool — pass 1 for
 // the sequential mode and the worker count for the concurrent one.
-func newSessionClient(cfg Config, concurrency int) (*query.QueryAPIClient, *http.Client, error) {
+func newSessionClient(cfg Config, streaming Streaming, concurrency int) (*query.QueryAPIClient, *http.Client, error) {
 	httpClient := transport.NewSession(cfg.Timeout, concurrency)
 	if cfg.HTTP2 {
 		h2Client, err := transport.NewSessionHTTP2(cfg.Timeout, concurrency)
@@ -267,6 +322,7 @@ func newSessionClient(cfg Config, concurrency int) (*query.QueryAPIClient, *http
 		query.WithLogger(cfg.Logger),
 		query.WithAPIFlavor(cfg.flavor()),
 		query.WithAccessMode(cfg.AccessMode),
+		query.WithStreamingSupport(streaming == StreamingOn),
 	)
 	if err != nil {
 		httpClient.CloseIdleConnections()

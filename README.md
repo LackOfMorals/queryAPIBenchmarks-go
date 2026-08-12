@@ -50,6 +50,7 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 | —                    | `-transaction` | _(required, unless `-api bolt`)_ | Transaction style (repeatable): `implicit`, `managed`, or `all` |
 | —                    | `-concurrency` | `sequential`      | Concurrency (repeatable): `sequential`, `concurrent`, or `all` |
 | —                    | `-connection`  | `fresh`           | HTTP connection reuse (repeatable): `fresh`, `pooled`, or `all` — not applicable to `-api bolt` |
+| —                    | `-streaming`   | `buffered`        | Response decoding (repeatable): `buffered`, `streaming`, or `all` — only supported with `-api queryv2 -transaction implicit`; requires `query-go-sdk` v0.5.0+ |
 
 ## Usage
 
@@ -76,6 +77,10 @@ Or pass flags directly on the command line (flags take precedence over env vars)
 
 # Target the legacy Cypher HTTP Transaction API (/db/{db}/tx/commit)
 ./bench -transaction implicit -api legacy -n 100
+
+# Buffered vs. streaming (ExecuteStream, query-go-sdk v0.5.0+) side by side —
+# queryv2 + implicit only; requires query-go-sdk v0.5.0+, see "Streaming" below
+./bench -api queryv2 -transaction implicit -streaming all -concurrency all -connection all -n 100 -queries-file queries.toml
 
 # Target the official Bolt driver (v6) — no -transaction/-connection needed,
 # Bolt only runs the auto-commit implicit style over one pooled Driver.
@@ -166,7 +171,7 @@ Use `-api` to select which Neo4j access backend the benchmarks target:
 
 ## Available tests
 
-Every test is described by up to three orthogonal flags, and a run sweeps
+Every test is described by up to four orthogonal flags, and a run sweeps
 the cartesian product of whatever values you pass:
 
 | Flag | Values | Meaning |
@@ -174,6 +179,7 @@ the cartesian product of whatever values you pass:
 | `-transaction` | `implicit`, `managed` | `implicit`: one HTTP call per iteration, the API manages the transaction. `managed`: three HTTP calls per iteration — begin → execute → commit. |
 | `-concurrency` | `sequential`, `concurrent` | Sequential loop vs. a goroutine pool (`-workers`). |
 | `-connection` | `fresh`, `pooled` | `fresh`: new TCP connection per request. `pooled`: keep-alive connection reuse (+ optional `-http2`). |
+| `-streaming` | `buffered`, `streaming` | `buffered`: `Execute` reads the whole response before returning. `streaming`: `ExecuteStream` decodes it incrementally (JSON Lines). `-api queryv2 -transaction implicit` only — see below. |
 
 For example, `-transaction implicit -concurrency concurrent -connection pooled`
 is what used to be called `GoroutinesSessionsImplicit`; the same run now
@@ -198,6 +204,49 @@ iteration. So Bolt:
 
 `-concurrency` still applies normally: `./bench -api bolt -concurrency all`
 runs both `implicit/sequential` and `implicit/concurrent`.
+
+### Streaming (`-streaming`) is Query API v2 implicit only
+
+[query-go-sdk v0.5.0](https://github.com/neo4j-contrib/query-go-sdk) added
+`ExecuteStream`, which decodes the Query API's response incrementally
+(JSON Lines) instead of buffering the whole thing before returning
+(`Execute`, the existing `buffered` default). This benchmark tool's
+`-streaming streaming` uses it — but only where it exists:
+
+- **`-api queryv2` only.** `query.WithStreamingSupport(true)` errors at
+  client construction if combined with `WithAPIFlavor(FlavorLegacyHTTP)` —
+  the legacy Cypher HTTP Transaction API has no streaming response format.
+  Passing `-api legacy -streaming streaming` (or `all`) is rejected before
+  any request is made.
+- **`-transaction implicit` only.** `ExecuteStream` is a `query-go-sdk`
+  method; `internal/managed`'s hand-rolled begin/execute/commit client
+  doesn't use that SDK at all and has no equivalent. Passing
+  `-transaction managed -streaming streaming` (or both flags as `all`
+  together) is rejected rather than silently dropping the invalid pair from
+  the sweep — run managed separately with `-streaming buffered` (its only
+  supported value) if you need both `-transaction all` and `-streaming all`
+  in the same investigation.
+- **Bolt is unaffected** and untouched by this flag: Bolt already streams
+  at the protocol level regardless of client choice, so `EagerResultTransformer`'s
+  buffering (`bolt.go`) is a client-side decision, not something a `-streaming`
+  equivalent would change.
+
+The streaming `Tx` path collects every decoded record into a slice before
+returning, deliberately — this is a fairness requirement, not a leftover.
+`Execute`/`EagerResultTransformer` materializes the whole result; discarding
+records as they arrive off `ExecuteStream` instead of collecting them would
+measure "does less work," not "decodes the wire format differently."
+
+Streaming's real advantage — starting to process a result before the whole
+response has arrived — doesn't show up distinctly in total per-call latency
+once a call is measured end-to-end to a fully-drained result, the way every
+other axis in this tool is measured. `bulk-rows` (the largest result set in
+the default query suite) is the one most likely to show *any* difference at
+all; a single-row query like `point-lookup` is more likely to show streaming
+as slightly *worse* (per-line JSON Lines decode overhead with nothing to
+amortize it against) than better. A genuine "time to first record" metric
+would need to widen `runner.TxFunc`'s contract beyond a single measured
+duration — out of scope for the current axis, and not yet implemented.
 
 ### Comparing legacy/queryv2/bolt fairly
 

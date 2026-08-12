@@ -35,42 +35,64 @@ func TestConfigFlavor(t *testing.T) {
 
 func TestDisplayName(t *testing.T) {
 	tests := []struct {
-		name string
-		kind Kind
-		tx   Transaction
-		conc Concurrency
-		conn Connection
-		want string
+		name   string
+		kind   Kind
+		tx     Transaction
+		conc   Concurrency
+		conn   Connection
+		stream Streaming
+		want   string
 	}{
 		{
-			name: "http includes the connection segment",
-			kind: KindQueryV2,
-			tx:   TransactionImplicit,
-			conc: ConcurrencySequential,
-			conn: ConnectionFresh,
-			want: "implicit/sequential/fresh",
+			name:   "queryv2 implicit includes the streaming segment",
+			kind:   KindQueryV2,
+			tx:     TransactionImplicit,
+			conc:   ConcurrencySequential,
+			conn:   ConnectionFresh,
+			stream: StreamingOff,
+			want:   "implicit/sequential/fresh/buffered",
 		},
 		{
-			name: "legacy managed concurrent pooled",
-			kind: KindLegacy,
-			tx:   TransactionManaged,
-			conc: ConcurrencyConcurrent,
-			conn: ConnectionPooled,
-			want: "managed/concurrent/pooled",
+			name:   "queryv2 implicit streaming",
+			kind:   KindQueryV2,
+			tx:     TransactionImplicit,
+			conc:   ConcurrencySequential,
+			conn:   ConnectionFresh,
+			stream: StreamingOn,
+			want:   "implicit/sequential/fresh/streaming",
 		},
 		{
-			name: "bolt omits the connection segment",
-			kind: KindBolt,
-			tx:   TransactionImplicit,
-			conc: ConcurrencyConcurrent,
-			conn: ConnectionPooled,
-			want: "implicit/concurrent",
+			name:   "queryv2 managed omits the streaming segment",
+			kind:   KindQueryV2,
+			tx:     TransactionManaged,
+			conc:   ConcurrencyConcurrent,
+			conn:   ConnectionPooled,
+			stream: StreamingOff,
+			want:   "managed/concurrent/pooled",
+		},
+		{
+			name:   "legacy managed concurrent pooled",
+			kind:   KindLegacy,
+			tx:     TransactionManaged,
+			conc:   ConcurrencyConcurrent,
+			conn:   ConnectionPooled,
+			stream: StreamingOff,
+			want:   "managed/concurrent/pooled",
+		},
+		{
+			name:   "bolt omits the connection and streaming segments",
+			kind:   KindBolt,
+			tx:     TransactionImplicit,
+			conc:   ConcurrencyConcurrent,
+			conn:   ConnectionPooled,
+			stream: StreamingOff,
+			want:   "implicit/concurrent",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := DisplayName(tt.kind, tt.tx, tt.conc, tt.conn); got != tt.want {
-				t.Errorf("DisplayName(%v, %v, %v, %v) = %q, want %q", tt.kind, tt.tx, tt.conc, tt.conn, got, tt.want)
+			if got := DisplayName(tt.kind, tt.tx, tt.conc, tt.conn, tt.stream); got != tt.want {
+				t.Errorf("DisplayName(%v, %v, %v, %v, %v) = %q, want %q", tt.kind, tt.tx, tt.conc, tt.conn, tt.stream, got, tt.want)
 			}
 		})
 	}
@@ -109,7 +131,7 @@ func TestNewClient_SelectsImplementation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client, err := newClient(tt.cfg, tt.tx, tt.conn, 1)
+			client, err := newClient(tt.cfg, tt.tx, tt.conn, StreamingOff, 1)
 			if err != nil {
 				t.Fatalf("newClient() error = %v", err)
 			}
@@ -117,6 +139,51 @@ func TestNewClient_SelectsImplementation(t *testing.T) {
 
 			if gotType, wantType := typeName(client), typeName(tt.want); gotType != wantType {
 				t.Errorf("newClient() returned %s, want %s", gotType, wantType)
+			}
+		})
+	}
+}
+
+// TestNewImplicitHTTPClient_StreamingField checks that the resolved
+// Streaming axis reaches httpImplicitClient.streaming, for both the fresh
+// and pooled/session construction paths — the field Tx branches on to pick
+// ExecuteStream over Execute/EagerResultTransformer.
+func TestNewImplicitHTTPClient_StreamingField(t *testing.T) {
+	baseCfg := Config{
+		URL:      "http://localhost:7474",
+		Username: "neo4j",
+		Password: "password",
+		Database: "neo4j",
+		Timeout:  time.Second,
+		Logger:   slog.New(slog.DiscardHandler),
+	}
+
+	tests := []struct {
+		name   string
+		conn   Connection
+		stream Streaming
+		want   bool
+	}{
+		{name: "fresh buffered", conn: ConnectionFresh, stream: StreamingOff, want: false},
+		{name: "fresh streaming", conn: ConnectionFresh, stream: StreamingOn, want: true},
+		{name: "pooled buffered", conn: ConnectionPooled, stream: StreamingOff, want: false},
+		{name: "pooled streaming", conn: ConnectionPooled, stream: StreamingOn, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := newImplicitHTTPClient(baseCfg, tt.conn, tt.stream, 1)
+			if err != nil {
+				t.Fatalf("newImplicitHTTPClient() error = %v", err)
+			}
+			t.Cleanup(func() { _ = client.Close(context.Background()) })
+
+			hc, ok := client.(*httpImplicitClient)
+			if !ok {
+				t.Fatalf("newImplicitHTTPClient() returned %T, want *httpImplicitClient", client)
+			}
+			if hc.streaming != tt.want {
+				t.Errorf("streaming = %v, want %v", hc.streaming, tt.want)
 			}
 		})
 	}

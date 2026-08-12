@@ -200,6 +200,19 @@ bench-bulk-rows: build
 	  -n $(N) -warmup $(WARMUP) -workers $(WORKERS)
 
 # ---------------------------------------------------------------------------
+# STREAMING vs. BUFFERED (Query API v2, implicit only)
+#    Requires query-go-sdk v0.5.0+ (ExecuteStream). Runs the whole query
+#    suite, buffered and streaming side by side, across concurrency and
+#    connection reuse — bulk-rows (1000-row result) is the one most likely
+#    to show a real difference; see the README's "Streaming" section.
+# ---------------------------------------------------------------------------
+bench-streaming: build
+	./bench -api queryv2 -transaction implicit -streaming all -concurrency all -connection all \
+	  -host $(NEO4J_HOST) -usr $(NEO4J_USERNAME) -pwd $(NEO4J_PASSWORD) \
+	  -db $(NEO4J_DATABASE) -queries-file queries.toml \
+	  -n $(N) -warmup $(WARMUP) -workers $(WORKERS)
+
+# ---------------------------------------------------------------------------
 # WARMUP-ONLY (run first, results discarded)
 # Sends a representative mix of queries to prime the JVM plan cache and
 # Neo4j page cache before any timed run. Use -warmup 0 here so nothing

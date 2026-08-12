@@ -45,11 +45,12 @@ func env(key, fallback string) string {
 func main() {
 	_ = godotenv.Load()
 
-	var transactionFlag, concurrencyFlag, connectionFlag multiFlag
+	var transactionFlag, concurrencyFlag, connectionFlag, streamingFlag multiFlag
 
 	flag.Var(&transactionFlag, "transaction", "Transaction style (repeatable): implicit, managed, or all. Required unless -api bolt (fixed at implicit).")
 	flag.Var(&concurrencyFlag, "concurrency", "Concurrency (repeatable): sequential, concurrent, or all. Default: sequential.")
 	flag.Var(&connectionFlag, "connection", "HTTP connection reuse (repeatable): fresh, pooled, or all. Default: fresh. Not applicable to -api bolt (always pooled).")
+	flag.Var(&streamingFlag, "streaming", "Response decoding (repeatable): buffered, streaming, or all. Default: buffered. Only supported with -api queryv2 -transaction implicit (requires query-go-sdk v0.5.0+).")
 
 	numRequests := flag.Int("n", intEnv("NUM_REQUESTS", 50), "Number of timed requests")
 	warmupRequests := flag.Int("warmup", intEnv("WARMUP_REQUESTS", 5), "Warmup iterations before timing (0 to skip)")
@@ -124,7 +125,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	cases := testCases(transactions, concurrencies, connections)
+	streamings, err := resolveStreaming(streamingFlag, kind)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if err := validateStreamingTransaction(transactions, streamings); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	cases := testCases(transactions, concurrencies, connections, streamings)
 
 	if *queriesFile != "" {
 		var cypherExplicit bool
@@ -197,14 +207,14 @@ func main() {
 		var runEntries []results.Entry
 		for _, q := range queries {
 			for _, c := range cases {
-				name := benchmarks.DisplayName(kind, c.tx, c.conc, c.conn)
+				name := benchmarks.DisplayName(kind, c.tx, c.conc, c.conn, c.stream)
 				if q.Label != "" {
 					fmt.Fprintf(os.Stderr, "\nRunning %s [%s]...\n", name, q.Label)
 				} else {
 					fmt.Fprintf(os.Stderr, "\nRunning %s...\n", name)
 				}
 
-				result, err := benchmarks.Run(ctx, benchCfg, q.Cypher, c.tx, c.conc, c.conn)
+				result, err := benchmarks.Run(ctx, benchCfg, q.Cypher, c.tx, c.conc, c.conn, c.stream)
 				if err != nil {
 					log.Printf("ERROR %s: %v\n", name, err)
 					aborted++
@@ -248,21 +258,24 @@ func main() {
 	}
 }
 
-// testCase is one resolved (transaction, concurrency, connection) combination
-// to run — the cartesian product of the -transaction/-concurrency/-connection
-// flag values.
+// testCase is one resolved (transaction, concurrency, connection, streaming)
+// combination to run — the cartesian product of the
+// -transaction/-concurrency/-connection/-streaming flag values.
 type testCase struct {
-	tx   benchmarks.Transaction
-	conc benchmarks.Concurrency
-	conn benchmarks.Connection
+	tx     benchmarks.Transaction
+	conc   benchmarks.Concurrency
+	conn   benchmarks.Connection
+	stream benchmarks.Streaming
 }
 
-func testCases(txs []benchmarks.Transaction, concs []benchmarks.Concurrency, conns []benchmarks.Connection) []testCase {
-	cases := make([]testCase, 0, len(txs)*len(concs)*len(conns))
+func testCases(txs []benchmarks.Transaction, concs []benchmarks.Concurrency, conns []benchmarks.Connection, streams []benchmarks.Streaming) []testCase {
+	cases := make([]testCase, 0, len(txs)*len(concs)*len(conns)*len(streams))
 	for _, tx := range txs {
 		for _, conc := range concs {
 			for _, conn := range conns {
-				cases = append(cases, testCase{tx: tx, conc: conc, conn: conn})
+				for _, stream := range streams {
+					cases = append(cases, testCase{tx: tx, conc: conc, conn: conn, stream: stream})
+				}
 			}
 		}
 	}
@@ -286,6 +299,12 @@ var connectionValues = map[string]benchmarks.Connection{
 	"pooled": benchmarks.ConnectionPooled,
 }
 var connectionAll = []benchmarks.Connection{benchmarks.ConnectionFresh, benchmarks.ConnectionPooled}
+
+var streamingValues = map[string]benchmarks.Streaming{
+	"buffered":  benchmarks.StreamingOff,
+	"streaming": benchmarks.StreamingOn,
+}
+var streamingAll = []benchmarks.Streaming{benchmarks.StreamingOff, benchmarks.StreamingOn}
 
 // resolveTransactions expands -transaction into the set of styles to run.
 // It's required for the HTTP APIs (matching the old "-t is required"
@@ -334,6 +353,40 @@ func resolveConnections(raw []string, kind benchmarks.Kind) ([]benchmarks.Connec
 		return nil, fmt.Errorf("-connection fresh is not supported with -api bolt: Bolt always uses one shared, pooled Driver — recreating a Driver per request isn't real usage")
 	}
 	return conns, nil
+}
+
+// resolveStreaming expands -streaming, defaulting to buffered when unset.
+// Streaming (query-go-sdk's ExecuteStream, v0.5.0+) only exists for the
+// Query API v2 implicit path: it errors if the SDK client also has
+// FlavorLegacyHTTP set, and query-go-sdk exposes no managed-transaction API
+// at all (see internal/managed). The implicit-vs-managed conflict is caught
+// separately in main, once both -transaction and -streaming are resolved.
+func resolveStreaming(raw []string, kind benchmarks.Kind) ([]benchmarks.Streaming, error) {
+	if len(raw) == 0 {
+		return []benchmarks.Streaming{benchmarks.StreamingOff}, nil
+	}
+	streams, err := expandValues(raw, "streaming", streamingValues, streamingAll)
+	if err != nil {
+		return nil, err
+	}
+	if contains(streams, benchmarks.StreamingOn) && kind != benchmarks.KindQueryV2 {
+		return nil, fmt.Errorf("-streaming streaming is only supported with -api queryv2: %s has no streaming response format", apiLabel(kind))
+	}
+	return streams, nil
+}
+
+// validateStreamingTransaction rejects -streaming streaming (or all)
+// combined with -transaction managed (or all): query-go-sdk's ExecuteStream
+// has no managed-transaction equivalent (see internal/managed's package
+// comment). Rejecting outright, rather than silently dropping the invalid
+// pair from an -transaction all -streaming all sweep, matches how
+// -api bolt -connection all is rejected instead of quietly filtered down to
+// pooled only.
+func validateStreamingTransaction(txs []benchmarks.Transaction, streams []benchmarks.Streaming) error {
+	if contains(txs, benchmarks.TransactionManaged) && contains(streams, benchmarks.StreamingOn) {
+		return fmt.Errorf("-streaming streaming is not supported with -transaction managed: query-go-sdk's ExecuteStream only covers the auto-commit implicit path; run managed separately with -streaming buffered")
+	}
+	return nil
 }
 
 // expandValues parses repeated flag values — each either a literal option or
